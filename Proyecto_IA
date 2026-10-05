@@ -14,20 +14,40 @@ tags: [markdown,ia,promt,local,SDD]
 ## 1. Vision general  del proyecto
 El objetivo del proyecto es desplegar una infraestuctura de Inteligencia Artificial local utilizando contenedores Docker en un sistema operativo Ubuntu Server. Cada servicio residira en su propio contenedor docker. El sistema dispone de tarjeta grafica NVIDIA (GPU)
 
-## 2. Servicios, especificaciones y aplicaciones 
+## 2. Servicios, especificaciones y aplicaciones
+
+## 3.1 Redes Docker
+Red principal  que se va a llamar "red-ia" a la que van a pertenecer todos los conetenedores para poder comunicarse entre si . 
+Red en modo bridge y crear un sistema de naming (DNS)  local del modo siguiente:
+| Servicio | Nombre de contenedor | Puerto interno |
+| :--- | :--- | :--- |
+| Ollama | Ollama | Ollama |
+
 Los servicios a despegar son los siguientes:
 | Servicio | Nombre de contenedor | Puerto interno | Puerto externo (Host) | Propósito principal | Dependencias |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Ollama** | ollama | 11434 | 11434 | Motor de LLMs locales y servidor de API | GPU NVIDIA y Driver (CUDA) |
-| **Open WebUI** | openwebui | 8080 | 3000 | Interfaz web tipo Chat GPT para interactuar con LLMs | Ollama, SearXNG |
-| **Hermes Agent** | hermes-agent | 8000 | 8000 | Arnes para el motor LLMs, Agente autonomo para realizar tareas complejas | Ollama, SearXNG, ComfyUI |
-| **OpenCode** | opencode | 8080 | 8443 | Entorno IDE para desarrollo de codigo (entorno web) similar a claude | Ollama |
-| **ComfyUI** | confyui | 8188 | 8188 | Interfaz web para la generacion, edicion y procesamiento de imagenes y video | GPU driver, sus propios LLMs |
-| **YOLO** | yolo | 5000 | 5000 | API o herramienta para la vision artificial, deteccion y reconocimiento de patrones en tiempo real en imagenes | GPU driver, sus propios LLMs |
-| **SearXNG** | searxng | 8080 | 8080 | x | x |
-| **RAG** | searxng | 8080 | 8080 | x | x |
+| **Ollama** | ollama | https://ollama:11434 |
+| **Open WebUI** | openwebui | https://openwebui:8080 |
+| **Hermes Agent** | hermes-agent | https://hermes-agent:8000 |
+| **OpenCode** | opencode | https://open-code:8443 |
+| **ComfyUI** | confyui | https://confyui:8188 |
+| **YOLO** | yolo | https://yolo:5000 |
+| **SearXNG** | searxng | https://searxng:8080 |
+| **RAG** | rag | **integrado con otros servicios**|
 
-## 3. Arquitectura de red y datos
+## 3. Volumenes de datos (Persistencia)
+ Consiste en "mapear" un sistema de ficheros dentro de cada contenedor a la maquina fisica que los contiene.
+| Nombre volumen | Direccionamiento | Descripcion |
+| :--- | :--- | :--- |
+| ollama_data | `/root/.ollama` | almacenamiento modelos LLM |
+| openwebui_data | / | https://openwebui:8080 |
+| **Hermes Agent** | hermes-agent | https://hermes-agent:8000 |
+| **OpenCode** | opencode | https://open-code:8443 |
+| **ComfyUI** | confyui | https://confyui:8188 |
+| **YOLO** | yolo | https://yolo:5000 |
+| **SearXNG** | searxng | https://searxng:8080 |
+| **RAG** | rag | **integrado con otros servicios**|
+
 ## 4. Requisitos de sistema y hardware
 ## 5. Instrucciones para generar el manual técnico 
 ## 6. Criterios de aceptacion
