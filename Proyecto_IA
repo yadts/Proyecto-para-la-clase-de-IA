@@ -39,15 +39,32 @@ Los servicios a despegar son los siguientes:
  Consiste en "mapear" un sistema de ficheros dentro de cada contenedor a la maquina fisica que los contiene.
 | Nombre volumen | Direccionamiento | Descripcion |
 | :--- | :--- | :--- |
-| ollama_data | `/root/.ollama` | almacenamiento modelos LLM |
-| openwebui_data | / | https://openwebui:8080 |
-| **Hermes Agent** | hermes-agent | https://hermes-agent:8000 |
-| **OpenCode** | opencode | https://open-code:8443 |
-| **ComfyUI** | confyui | https://confyui:8188 |
-| **YOLO** | yolo | https://yolo:5000 |
-| **SearXNG** | searxng | https://searxng:8080 |
-| **RAG** | rag | **integrado con otros servicios**|
+| ollama_data | `$HOME/.ollama` | almacenamiento modelos LLM |
+| openwebui_data | `$HOME/openwebui` | usuarios, chats, prompts, configuraciones |
+| **Hermes Agent** | `$HOME/hermes` | Configuracion de los agentes |
+| **OpenCode** | `$HOME/opencode` | Codigo de los proyectos y las configuraciones |
+| **ComfyUI** | `$HOME/confyui´ | Imagenes y videos generados, prompts y modelos generativos |
+| **YOLO** | `$HOME/yolo` | Dataset de los videos o imagenes analizadas |
+| **SearXNG** | `$HOME/searxng` | Resultados de las busquedas realizadas |
+| **RAG** | `$HOME/rag` | Ficheros que se le dotan para aumentar el conocimiento a la IA |
 
 ## 4. Requisitos de sistema y hardware
-## 5. Instrucciones para generar el manual técnico 
+1. **SO:** Ubuntu server 24.04 o 26.06
+2. **GPU.** Tarjetas grafica NVIDIA, algunos ordenadores con el modelo 3050, 4060.
+3. **Drivers.** Driver NVIDIA CUDA o nvidia-drivers oficiales.
+4. **Docker.** Sistema de contenedores para cada servicio, docker compose, y docker.
+
+## 5. Instrucciones para generar el manual técnico
+> **Instrucciones para la generacion del documento de salida:**
+> Actua como un experto en administracion de sistemas GNU/Linux y Devops, genera un **Manual de instalacion, 
+configuracion y operacion** exhaustivo y detallado en formato Markdown basado en  esta especificacion.
+> El manua generado debe incluir obligatoriamente las siguientes secciones:
+> 1. **Prerrequisitos e instalacion base:** Comandos basicos en linux para instalar Docker, Docker Compose,
+Driver de NVIDIA CUDA, utilizando repositorios apt.
+> 2. **Estructura del proyecto:** Arbol detallado de directorios para el stack que vamos a montar 
+`$HOME/proyecto`
+> 3. **Ficheros de configuracion:** `docker-<servicio>.yml` por cada uno de los servicios que vamos a montar
+donde <servicio> se sustituye por el nombre del contenedor.
+> 4. **Fichero de entorno:** Ficheros `.env` con todas las variables del entorno de todos los servicios.
+
 ## 6. Criterios de aceptacion
