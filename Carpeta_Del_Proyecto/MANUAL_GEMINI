@@ -1,0 +1,551 @@
+title: "Manual Técnico: Despliegue de una Pila de IA Local en Docker sobre Ubuntu"
+author: "Administración de Sistemas / DevOps"
+date: "2026-09-29"
+version: "1.0"
+
+Manual Técnico de Instalación, Configuración y Operación: Pila de IA Local
+
+Este documento constituye una guía paso a paso para desplegar y administrar una pila completa de servicios de Inteligencia Artificial utilizando contenedores Docker sobre un sistema operativo Ubuntu Server con soporte para GPUs NVIDIA.
+
+1. Prerrequisitos e Instalación Base
+
+En esta sección prepararemos el sistema operativo Ubuntu Server actualizando repositorios e instalando Docker Engine, Docker Compose V2 y los controladores oficiales de NVIDIA junto con el NVIDIA Container Toolkit para el uso de CUDA dentro de los contenedores.
+
+1.1. Actualización del Sistema
+
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y curl wget git build-essential ca-certificates gnupg lsb-release
+
+
+1.2. Instalación de Drivers NVIDIA y Soporte CUDA
+
+Instalamos los controladores de NVIDIA adecuados para la tarjeta gráfica (ej. RTX 3050 / 4060):
+
+# Añadir repositorio oficial de controladores NVIDIA
+sudo add-apt-repository ppa:graphics-drivers/ppa -y
+sudo apt update
+
+# Instalación del driver recomendado para tarjetas modernas
+sudo apt install -y nvidia-driver-535 nvidia-utils-535
+
+# Verificar la instalación del driver tras reiniciar el sistema
+sudo reboot
+
+
+Tras reiniciar, comprueba la detección de la GPU con:
+
+nvidia-smi
+
+
+1.3. Instalación de Docker Engine y Docker Compose
+
+# Añadir la clave GPG oficial de Docker
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+# Configurar el repositorio
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# Añadir el usuario actual al grupo docker para ejecutar sin sudo
+sudo usermod -aG docker $USER
+newgrp docker
+
+
+1.4. Instalación de NVIDIA Container Toolkit
+
+Permite a los contenedores Docker acceder a los recursos de aceleración de hardware GPU.
+
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+  && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+    sed 's#deb [^ ]* #&[signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] #' | \
+    sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+sudo apt update
+sudo apt install -y nvidia-container-toolkit
+
+# Configurar el runtime de Docker
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+
+
+Verificar el acceso de Docker a la GPU:
+
+docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi
+
+
+2. Estructura del Proyecto
+
+Toda la pila de servicios y la persistencia de datos se organizará dentro del directorio $HOME/proyecto.
+
+mkdir -p $HOME/proyecto/{compose,ollama,openwebui,hermes,opencode,comfyui,yolo,searxng,rag}
+
+
+Estructura de archivos y directorios resultante:
+
+$HOME/proyecto/
+├── .env
+├── compose/
+│   ├── docker-ollama.yml
+│   ├── docker-openwebui.yml
+│   ├── docker-hermes-agent.yml
+│   ├── docker-opencode.yml
+│   ├── docker-comfyui.yml
+│   ├── docker-yolo.yml
+│   ├── docker-searxng.yml
+│   └── docker-rag.yml
+├── ollama/
+├── openwebui/
+├── hermes/
+├── opencode/
+├── comfyui/
+├── yolo/
+├── searxng/
+└── rag/
+
+
+3. Fichero de Entorno (.env)
+
+Crea el archivo $HOME/proyecto/.env para definir las variables comunes de red, puertos y rutas de datos:
+
+# Variables Generales de Red y Sistema
+PROJECT_NAME=pila-ia
+DOCKER_NETWORK=red-ia
+DATA_BASE_DIR=/home/usuario/proyecto
+
+# Ollama
+OLLAMA_PORT_HOST=11434
+OLLAMA_PORT_CONTAINER=11434
+
+# Open WebUI
+OPENWEBUI_PORT_HOST=3000
+OPENWEBUI_PORT_CONTAINER=8080
+
+# Hermes Agent
+HERMES_PORT_HOST=8000
+HERMES_PORT_CONTAINER=8000
+
+# OpenCode
+OPENCODE_PORT_HOST=8443
+OPENCODE_PORT_CONTAINER=8080
+
+# ComfyUI
+COMFYUI_PORT_HOST=8188
+COMFYUI_PORT_CONTAINER=8188
+
+# YOLO API
+YOLO_PORT_HOST=5000
+YOLO_PORT_CONTAINER=5000
+
+# SearXNG
+SEARXNG_PORT_HOST=8080
+SEARXNG_PORT_CONTAINER=8080
+SEARXNG_SECRET_KEY=clave_secreta_super_segura_searxng_2026
+
+# RAG
+RAG_PORT_HOST=11435
+RAG_PORT_CONTAINER=11434
+
+
+Nota: Reemplaza /home/usuario/proyecto en DATA_BASE_DIR por la ruta absoluta real de tu directorio home.
+
+4. Ficheros de Configuración Docker Compose
+
+Crearemos un archivo .yml por cada servicio dentro de la carpeta $HOME/proyecto/compose/. Todos compartirán la red red-ia.
+
+4.1. Red Común
+
+Antes de desplegar los servicios, crearemos la red externa Docker en modo bridge:
+
+docker network create red-ia
+
+
+4.2. docker-ollama.yml
+
+version: '3.8'
+
+networks:
+  red-ia:
+    external: true
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT_HOST}:${OLLAMA_PORT_CONTAINER}"
+    volumes:
+      - ${DATA_BASE_DIR}/ollama:/root/.ollama
+    networks:
+      - red-ia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+
+4.3. docker-openwebui.yml
+
+version: '3.8'
+
+networks:
+  red-ia:
+    external: true
+
+services:
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: openwebui
+    restart: unless-stopped
+    ports:
+      - "${OPENWEBUI_PORT_HOST}:${OPENWEBUI_PORT_CONTAINER}"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - ENABLE_RAG_WEB_SEARCH=True
+      - RAG_WEB_SEARCH_ENGINE=searxng
+      - SEARXNG_QUERY_URL=http://searxng:8080/search?q=<query>
+    volumes:
+      - ${DATA_BASE_DIR}/openwebui:/app/backend/data
+    networks:
+      - red-ia
+    depends_on:
+      - ollama
+
+
+4.4. docker-hermes-agent.yml
+
+version: '3.8'
+
+networks:
+  red-ia:
+    external: true
+
+services:
+  hermes-agent:
+    image: hermes-agent:latest
+    container_name: hermes-agent
+    restart: unless-stopped
+    ports:
+      - "${HERMES_PORT_HOST}:${HERMES_PORT_CONTAINER}"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - SEARXNG_HOST=http://searxng:8080
+      - COMFYUI_HOST=http://comfyui:8188
+    volumes:
+      - ${DATA_BASE_DIR}/hermes:/app/config
+    networks:
+      - red-ia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+
+4.5. docker-opencode.yml
+
+version: '3.8'
+
+networks:
+  red-ia:
+    external: true
+
+services:
+  opencode:
+    image: codercom/code-server:latest
+    container_name: opencode
+    restart: unless-stopped
+    ports:
+      - "${OPENCODE_PORT_HOST}:${OPENCODE_PORT_CONTAINER}"
+    environment:
+      - OLLAMA_API_BASE=http://ollama:11434
+    volumes:
+      - ${DATA_BASE_DIR}/opencode:/home/coder/project
+    networks:
+      - red-ia
+
+
+4.6. docker-comfyui.yml
+
+version: '3.8'
+
+networks:
+  red-ia:
+    external: true
+
+services:
+  comfyui:
+    image: yananyi/comfyui:latest
+    container_name: comfyui
+    restart: unless-stopped
+    ports:
+      - "${COMFYUI_PORT_HOST}:${COMFYUI_PORT_CONTAINER}"
+    volumes:
+      - ${DATA_BASE_DIR}/comfyui:/app/data
+    networks:
+      - red-ia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+
+4.7. docker-yolo.yml
+
+version: '3.8'
+
+networks:
+  red-ia:
+    external: true
+
+services:
+  yolo:
+    image: ultralytics/ultralytics:latest
+    container_name: yolo
+    restart: unless-stopped
+    ports:
+      - "${YOLO_PORT_HOST}:${YOLO_PORT_CONTAINER}"
+    volumes:
+      - ${DATA_BASE_DIR}/yolo:/usr/src/app/datasets
+    networks:
+      - red-ia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+
+4.8. docker-searxng.yml
+
+version: '3.8'
+
+networks:
+  red-ia:
+    external: true
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    ports:
+      - "${SEARXNG_PORT_HOST}:${SEARXNG_PORT_CONTAINER}"
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080/
+      - INSTANCE_NAME=searxng-local
+    volumes:
+      - ${DATA_BASE_DIR}/searxng:/etc/searxng
+    networks:
+      - red-ia
+
+
+4.9. docker-rag.yml
+
+version: '3.8'
+
+networks:
+  red-ia:
+    external: true
+
+services:
+  rag:
+    image: chromadb/chroma:latest
+    container_name: rag
+    restart: unless-stopped
+    ports:
+      - "${RAG_PORT_HOST}:${RAG_PORT_CONTAINER}"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      - ${DATA_BASE_DIR}/rag:/chroma/chroma
+    networks:
+      - red-ia
+
+
+5. Despliegue y Verificación
+
+5.1. Arranque de los Servicios
+
+Para desplegar todos los servicios pasando el archivo de variables .env:
+
+cd $HOME/proyecto
+
+# Desplegar los servicios uno a uno o de forma coordinada
+docker compose --env-file .env -f compose/docker-ollama.yml up -d
+docker compose --env-file .env -f compose/docker-searxng.yml up -d
+docker compose --env-file .env -f compose/docker-openwebui.yml up -d
+docker compose --env-file .env -f compose/docker-comfyui.yml up -d
+docker compose --env-file .env -f compose/docker-yolo.yml up -d
+docker compose --env-file .env -f compose/docker-opencode.yml up -d
+docker compose --env-file .env -f compose/docker-hermes-agent.yml up -d
+docker compose --env-file .env -f compose/docker-rag.yml up -d
+
+
+5.2. Verificación del Estado y Logs
+
+# Verificar contenedores en ejecución
+docker ps
+
+# Inspeccionar logs de un contenedor concreto (ej. Ollama)
+docker logs -f ollama
+
+# Supervisar el consumo de GPU por parte de los contenedores
+nvidia-smi
+
+
+5.3. Tabla de Accesos Web
+
+Servicio
+
+URL Host
+
+Descripción
+
+Open WebUI
+
+http://<IP-HOST>:3000
+
+Interfaz conversacional tipo ChatGPT
+
+OpenCode
+
+http://<IP-HOST>:8443
+
+IDE Web para desarrollo
+
+ComfyUI
+
+http://<IP-HOST>:8188
+
+Interfaz visual de generación multimedia
+
+SearXNG
+
+http://<IP-HOST>:8080
+
+Engine metabuscador web
+
+Ollama API
+
+http://<IP-HOST>:11434
+
+Endpoint API local de LLMs
+
+YOLO API
+
+http://<IP-HOST>:5000
+
+API para visión por computador
+
+Hermes Agent
+
+http://<IP-HOST>:8000
+
+Panel/API del agente autónomo
+
+6. Guía de Integración Interna
+
+Los servicios se comunican internamente utilizando la red red-ia mediante resolución DNS interna por el nombre de contenedor.
+
+6.1. Integración Open WebUI con Ollama y SearXNG
+
+Acceder a Open WebUI en http://<IP-HOST>:3000.
+
+Crear la cuenta de administrador inicial.
+
+Ir a Admin Settings > Connections:
+
+URL API de Ollama: http://ollama:11434
+
+Ir a Admin Settings > Web Search:
+
+Activar la búsqueda web.
+
+Seleccionar motor: searxng
+
+URL de SearXNG: http://searxng:8080/search?q=<query>
+
+6.2. Descargar un Modelo LLM en Ollama
+
+Ejecuta el siguiente comando para descargar un modelo funcional (ej. Llama 3 o Mistral) dentro del contenedor de Ollama:
+
+docker exec -it ollama ollama run llama3
+
+
+6.3. Integración de OpenCode con Ollama
+
+Dentro de OpenCode (http://<IP-HOST>:8443), configura las extensiones de autocompletado de código (ej. Continue o Tabby) para apuntar a la API interna:
+
+Base URL: http://ollama:11434
+
+Model: codellama o llama3
+
+7. Mantenimiento y Actualización
+
+7.1. Actualización de Contenedores
+
+Para actualizar los servicios a sus versiones más recientes:
+
+cd $HOME/proyecto
+
+# Descargar las imágenes más recientes
+docker compose -f compose/docker-ollama.yml pull
+docker compose -f compose/docker-openwebui.yml pull
+
+# Reiniciar los contenedores actualizados
+docker compose --env-file .env -f compose/docker-ollama.yml up -d
+docker compose --env-file .env -f compose/docker-openwebui.yml up -d
+
+
+7.2. Copias de Seguridad (Backups)
+
+Para realizar una copia de seguridad de las configuraciones y los chats de Open WebUI o la base de datos de RAG:
+
+# Detener el servicio temporalmente
+docker stop openwebui
+
+# Crear un archivo comprimido de los datos
+tar -cvzf $HOME/backup_openwebui_$(date +%Y%m%d).tar.gz $HOME/proyecto/openwebui
+
+# Reanudar el servicio
+docker start openwebui
+
+
+7.3. Resolución de Problemas Comunes
+
+Permisos Denegados en los Volúmenes Montados
+
+Si un contenedor falla al escribir en las carpetas mapeadas dentro de $HOME/proyecto/:
+
+sudo chown -R 1000:1000 $HOME/proyecto/
+sudo chmod -R 775 $HOME/proyecto/
+
+
+Falso Positivo: "GPU not detected in container"
+
+Si nvidia-smi funciona en el host pero no en Docker:
+
+Asegúrate de haber reiniciado el servicio Docker tras instalar nvidia-container-toolkit:
+
+sudo systemctl restart docker
+
+
+Revisa que el bloque deploy.resources.reservations.devices está bien estructurado en los ficheros YAML.
