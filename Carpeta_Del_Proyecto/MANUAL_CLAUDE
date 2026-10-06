@@ -1,0 +1,1532 @@
+---
+title: "Manual de instalación, configuración y operación: Pila de IA local en Docker sobre Ubuntu Server"
+author: "Mnarrieta"
+date: "2026-10-06"
+category: "Despliegue IA"
+tags: [markdown, ia, docker, nvidia, ollama, openwebui, SDD]
+version: "1.0"
+---
+
+# Manual de instalación, configuración y operación: pila de IA local en Docker sobre Ubuntu Server
+
+Este manual se ha generado a partir de la especificación SDD "Despliegue de una pila de IA Local en Docker sobre Ubuntu" (v1.0). Está escrito paso a paso para un administrador de sistemas que no haya montado antes una pila de este tipo.
+
+## 0. Antes de empezar
+
+### 0.1. Qué vamos a montar
+
+Ocho servicios, cada uno en su propio contenedor, todos conectados a una red Docker llamada `red-ia`:
+
+| Servicio | Contenedor | Puerto interno | Puerto externo (host) | Usa GPU |
+| :--- | :--- | :---: | :---: | :---: |
+| Ollama | `ollama` | 11434 | 11434 | Sí |
+| Open WebUI | `openwebui` | 8080 | 3000 | Sí (imagen `cuda`, embeddings/reranking) |
+| Hermes Agent | `hermes-agent` | 8000 | 8000 | No (usa la GPU a través de Ollama) |
+| OpenCode | `opencode` | 8080 | 8443 | No (usa la GPU a través de Ollama) |
+| ComfyUI | `comfyui` | 8188 | 8188 | Sí |
+| YOLO | `yolo` | 5000 | 5000 | Sí |
+| SearXNG | `searxng` | 8080 | 8080 | No (no existe uso de GPU en un metabuscador) |
+| RAG (Qdrant) | `rag` | 6333 / 6334 | 6333 / 6334 | No (los embeddings se calculan en Ollama, que sí usa GPU) |
+
+### 0.2. Decisiones de diseño y diferencias respecto a la especificación
+
+Al convertir la especificación en ficheros funcionales hay puntos que, tal cual están escritos, no se pueden cumplir. Se han resuelto así, y conviene que los conozca antes de empezar:
+
+1. **Colisión de puertos (criterio de aceptación 3).** La especificación asigna `11434:11434` tanto a Ollama como al servicio RAG. Dos contenedores no pueden publicar el mismo puerto en el host. Solución: el servicio `rag` se implementa con **Qdrant** (base de datos vectorial) en los puertos **6333** (API REST) y **6334** (gRPC). Open WebUI lo usa como almacén vectorial y Ollama calcula los embeddings.
+2. **Puertos internos en la tabla de DNS.** La tabla de la sección 3.1 de la especificación indica `http://openwebui:3000` y `http://opencode:8443`. Esos son los puertos **externos** del host. Dentro de la red `red-ia` los contenedores se hablan con el puerto **interno**: `http://openwebui:8080` y `http://opencode:8080`.
+3. **Nombre `hermesagent`.** La especificación nombra el contenedor `hermes-agent` pero su URL usa `hermesagent`. Se crea un *alias de red* para que ambos nombres funcionen.
+4. **Nombre de los ficheros.** La especificación usa `docker-<servicio>.yml` en un sitio y `docker_<servicio>.yml` en otro. Se usa el guion: `docker-<servicio>.yml`.
+5. **Ubicación de los datos.** Los volúmenes se mapean en `$HOME/<servicio>` (como indica la sección 3.2) y los ficheros de configuración del stack viven en `$HOME/proyecto`. La variable `DATA_DIR` del fichero `.env` permite cambiar la raíz de los datos si se prefiere otra.
+6. **SearXNG y GPU.** La especificación lo lista con dependencia de driver GPU. SearXNG no usa GPU, así que no se le asigna.
+7. **Memoria de vídeo (VRAM).** Una RTX 3050 o 4060 tiene entre 6 y 8 GB. Ollama, ComfyUI y YOLO **no caben a la vez** en memoria de GPU con modelos grandes. El manual configura Ollama para descargar los modelos tras 5 minutos de inactividad y ComfyUI/YOLO con valores conservadores (ver sección 4 y apéndice A).
+8. **Hermes Agent y OpenCode.** Son proyectos que evolucionan deprisa. Las imágenes y comandos usados aquí son los publicados en octubre de 2026; si algún parámetro cambia, la sección 6.5 explica cómo comprobarlo.
+
+### 0.3. Convenciones del manual
+
+- `$HOME` es el directorio personal del usuario administrador (por ejemplo `/home/admin`).
+- Los comandos que empiezan por `sudo` requieren privilegios de administrador.
+- Los bloques marcados `bash` se copian y pegan en la terminal tal cual.
+- Cuando vea `__GENERAR__` en un fichero, es un marcador que el script `init.sh` sustituye por una contraseña aleatoria.
+
+---
+
+## 1. Prerrequisitos e instalación base
+
+### 1.1. Requisitos mínimos
+
+| Elemento | Requisito |
+| :--- | :--- |
+| Sistema operativo | Ubuntu Server 24.04 LTS o 26.04 LTS, instalación limpia, con acceso SSH |
+| GPU | NVIDIA (RTX 3050, 4060 o superior), con al menos 6 GB de VRAM |
+| RAM | 16 GB recomendados (mínimo 8 GB) |
+| Disco | 150 GB libres como mínimo (los modelos de IA ocupan decenas de GB) |
+| Red | Conexión a Internet para descargar paquetes, imágenes y modelos |
+
+### 1.2. Actualizar el sistema
+
+```bash
+sudo apt update
+sudo apt full-upgrade -y
+sudo apt install -y ca-certificates curl gnupg git jq htop pciutils ubuntu-drivers-common
+sudo reboot
+```
+
+Vuelva a entrar por SSH cuando la máquina reinicie.
+
+### 1.3. Comprobar que el sistema ve la tarjeta gráfica
+
+```bash
+lspci | grep -i nvidia
+```
+
+Debe aparecer una línea con el modelo de su tarjeta. Si no aparece nada, revise la BIOS (que la GPU esté habilitada) o el cableado antes de continuar.
+
+### 1.4. Instalar el driver de NVIDIA (incluye soporte CUDA)
+
+El driver propietario de NVIDIA ya incluye el soporte CUDA que necesitan los contenedores. **No hace falta instalar el *CUDA Toolkit* completo en el host**: cada imagen Docker trae sus propias librerías CUDA.
+
+```bash
+# Ver qué driver recomienda Ubuntu para su tarjeta
+ubuntu-drivers devices
+
+# Instalar el driver recomendado para cómputo (servidores)
+sudo ubuntu-drivers install --gpgpu
+
+# Reiniciar para cargar el driver
+sudo reboot
+```
+
+Tras el reinicio compruebe que funciona:
+
+```bash
+nvidia-smi
+```
+
+Debe mostrar una tabla con el nombre de su GPU, la versión del driver y la versión de CUDA. **Requisito:** driver 570 o superior (los contenedores de este manual usan CUDA 12.8). Si `ubuntu-drivers` le instala una versión anterior, instale una concreta:
+
+```bash
+apt search nvidia-driver | grep -E "server|open" | head
+sudo apt install -y nvidia-driver-580-server   # sustituya por la versión disponible
+sudo reboot
+```
+
+> **Si `nvidia-smi` dice "command not found" o "NVIDIA-SMI has failed":** el driver no se cargó. Compruebe si Secure Boot está activado (`mokutil --sb-state`). Con Secure Boot activo, Ubuntu pide registrar una clave (MOK) durante el reinicio; si no se hizo, desactive Secure Boot en la BIOS o repita la instalación y acepte la clave.
+
+### 1.5. Instalar Docker Engine y Docker Compose desde el repositorio oficial
+
+```bash
+# 1) Clave GPG del repositorio de Docker
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+# 2) Añadir el repositorio
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+https://download.docker.com/linux/ubuntu \
+$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" \
+| sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# 3) Instalar
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# 4) Permitir usar docker sin sudo (cierre sesión y vuelva a entrar después)
+sudo usermod -aG docker $USER
+newgrp docker
+
+# 5) Verificar
+docker --version
+docker compose version
+docker run --rm hello-world
+```
+
+> **Alternativa si el repositorio de Docker aún no publica paquetes para su versión de Ubuntu (puede ocurrir con 26.04 poco después de su lanzamiento):** use los paquetes de Ubuntu: `sudo apt install -y docker.io docker-compose-v2`. Todo el manual funciona igual con ellos.
+
+### 1.6. Instalar NVIDIA Container Toolkit (GPU dentro de los contenedores)
+
+Este componente es el que permite que Docker "pase" la GPU a un contenedor. Sin él, ningún contenedor verá la tarjeta.
+
+```bash
+# 1) Repositorio
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+# 2) Instalar
+sudo apt update
+sudo apt install -y nvidia-container-toolkit
+
+# 3) Registrar el runtime en Docker y reiniciar
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+**Prueba decisiva:** un contenedor que ejecute `nvidia-smi`.
+
+```bash
+docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu24.04 nvidia-smi
+```
+
+Si ve la misma tabla que en el host, la GPU ya es accesible desde Docker. **No continúe hasta que esto funcione.**
+
+### 1.7. Crear la red Docker `red-ia`
+
+```bash
+docker network create --driver bridge red-ia
+docker network ls | grep red-ia
+```
+
+En una red *bridge* definida por el usuario, Docker incluye un DNS interno: cada contenedor es localizable por su nombre (`ollama`, `searxng`, etc.). Es lo que permite las URL `http://ollama:11434` del resto del manual.
+
+---
+
+## 2. Estructura del proyecto
+
+### 2.1. Árbol de directorios
+
+```text
+$HOME/
+├── proyecto/                         # Configuración del stack (este es el "repositorio")
+│   ├── .env                          # Variables de entorno de TODOS los servicios
+│   ├── docker-ollama.yml
+│   ├── docker-openwebui.yml
+│   ├── docker-hermes-agent.yml
+│   ├── docker-opencode.yml
+│   ├── docker-comfyui.yml
+│   ├── docker-yolo.yml
+│   ├── docker-searxng.yml
+│   ├── docker-rag.yml
+│   ├── build/                        # Imágenes que se construyen localmente
+│   │   ├── opencode/Dockerfile
+│   │   ├── comfyui/Dockerfile
+│   │   └── yolo/
+│   │       ├── Dockerfile
+│   │       └── app/main.py
+│   ├── scripts/
+│   │   ├── init.sh                   # Prepara .env, secretos y permisos
+│   │   ├── up.sh                     # Arranca todo en orden
+│   │   ├── down.sh                   # Para todo
+│   │   ├── test.sh                   # Pruebas de humo
+│   │   ├── backup.sh                 # Copia de seguridad
+│   │   └── update.sh                 # Actualización de servicios
+│   └── backups/                      # Copias generadas
+│
+├── ollama/                           # Volumen: modelos LLM            (/root/.ollama)
+├── openwebui/                        # Volumen: usuarios, chats, config (/app/backend/data)
+├── hermes/                           # Volumen: configuración agentes   (/opt/data)
+├── opencode/
+│   ├── workspace/                    # Código de los proyectos          (/workspace)
+│   ├── config/                       # opencode.json                    (/root/.config/opencode)
+│   └── share/                        # Sesiones y credenciales          (/root/.local/share/opencode)
+├── comfyui/
+│   ├── models/                       # checkpoints, loras, vae, ...     (/app/models)
+│   ├── output/                       # Imágenes y vídeos generados      (/app/output)
+│   ├── input/                        # Imágenes de entrada              (/app/input)
+│   ├── user/                         # Workflows y ajustes              (/app/user)
+│   └── custom_nodes/                 # Extensiones                      (/app/custom_nodes)
+├── yolo/
+│   ├── models/                       # Pesos .pt descargados            (/data/models)
+│   └── dataset/                      # Imágenes/vídeos analizados       (/data/dataset)
+├── searxng/
+│   ├── config/                       # settings.yml                     (/etc/searxng)
+│   └── data/                         # Caché de búsquedas               (/var/cache/searxng)
+└── rag/
+    ├── storage/                      # Base vectorial Qdrant            (/qdrant/storage)
+    └── docs/                         # Documentos de origen (staging)
+```
+
+### 2.2. Crear los directorios
+
+```bash
+# Configuración del stack
+mkdir -p ~/proyecto/{build/opencode,build/comfyui,build/yolo/app,scripts,backups}
+
+# Datos persistentes (volúmenes)
+mkdir -p ~/ollama ~/openwebui ~/hermes
+mkdir -p ~/opencode/{workspace,config,share}
+mkdir -p ~/comfyui/{input,output,user,custom_nodes}
+mkdir -p ~/comfyui/models/{checkpoints,loras,vae,controlnet,clip,unet,diffusion_models,text_encoders,embeddings,upscale_models}
+mkdir -p ~/yolo/{models,dataset}
+mkdir -p ~/searxng/{config,data}
+mkdir -p ~/rag/{storage,docs}
+
+# Comprobar
+find ~/proyecto -maxdepth 2 -type d | sort
+```
+
+---
+## 3. Ficheros de configuración
+
+Se crea **un fichero por servicio**. Todos se guardan en `~/proyecto/` y siguen el mismo patrón:
+
+- `name:` distinto en cada fichero: así Docker Compose trata cada servicio como un proyecto independiente y no avisa de "contenedores huérfanos".
+- Las variables `${...}` se leen del fichero `.env` (sección 4), que debe estar en el mismo directorio.
+- Todos se conectan a la red externa `red-ia` (creada en 1.7).
+- Los volúmenes son *bind mounts* a `${DATA_DIR}/<servicio>` (en la práctica, `$HOME/<servicio>`).
+
+> **Importante:** como cada servicio es un fichero distinto, Compose no puede usar `depends_on` entre ellos. El orden de arranque lo garantiza el script `up.sh` (sección 5).
+
+Para crear cada fichero: `nano ~/proyecto/docker-<servicio>.yml`, pegar el contenido, `Ctrl+O`, `Enter`, `Ctrl+X`.
+
+### 3.1. `docker-ollama.yml`
+
+```yaml
+name: ia-ollama
+
+services:
+  ollama:
+    image: ollama/ollama:${OLLAMA_TAG:-latest}
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ${DATA_DIR}/ollama:/root/.ollama
+    environment:
+      TZ: ${TZ}
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-5m}
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-1}
+      OLLAMA_FLASH_ATTENTION: ${OLLAMA_FLASH_ATTENTION:-1}
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-8192}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    networks:
+      - red-ia
+
+networks:
+  red-ia:
+    external: true
+    name: red-ia
+```
+
+### 3.2. `docker-rag.yml` (Qdrant)
+
+```yaml
+name: ia-rag
+
+services:
+  rag:
+    image: qdrant/qdrant:${RAG_TAG:-latest}
+    container_name: rag
+    restart: unless-stopped
+    ports:
+      - "${RAG_PORT:-6333}:6333"
+      - "${RAG_GRPC_PORT:-6334}:6334"
+    volumes:
+      - ${DATA_DIR}/rag/storage:/qdrant/storage
+    environment:
+      TZ: ${TZ}
+      QDRANT__SERVICE__API_KEY: ${RAG_API_KEY}
+    networks:
+      - red-ia
+
+networks:
+  red-ia:
+    external: true
+    name: red-ia
+```
+
+### 3.3. `docker-searxng.yml`
+
+```yaml
+name: ia-searxng
+
+services:
+  searxng:
+    image: searxng/searxng:${SEARXNG_TAG:-latest}
+    container_name: searxng
+    restart: unless-stopped
+    ports:
+      - "${SEARXNG_PORT:-8080}:8080"
+    volumes:
+      - ${DATA_DIR}/searxng/config:/etc/searxng
+      - ${DATA_DIR}/searxng/data:/var/cache/searxng
+    environment:
+      TZ: ${TZ}
+      SEARXNG_BASE_URL: ${SEARXNG_BASE_URL}
+    networks:
+      - red-ia
+
+networks:
+  red-ia:
+    external: true
+    name: red-ia
+```
+
+### 3.4. `docker-comfyui.yml`
+
+```yaml
+name: ia-comfyui
+
+services:
+  comfyui:
+    build:
+      context: ./build/comfyui
+      args:
+        PYTORCH_IMAGE: ${COMFYUI_PYTORCH_IMAGE}
+    image: ia/comfyui:local
+    container_name: comfyui
+    restart: unless-stopped
+    command: python main.py --listen 0.0.0.0 --port 8188 ${COMFYUI_EXTRA_ARGS:-}
+    ports:
+      - "${COMFYUI_PORT:-8188}:8188"
+    volumes:
+      - ${DATA_DIR}/comfyui/models:/app/models
+      - ${DATA_DIR}/comfyui/output:/app/output
+      - ${DATA_DIR}/comfyui/input:/app/input
+      - ${DATA_DIR}/comfyui/user:/app/user
+      - ${DATA_DIR}/comfyui/custom_nodes:/app/custom_nodes
+    environment:
+      TZ: ${TZ}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - red-ia
+
+networks:
+  red-ia:
+    external: true
+    name: red-ia
+```
+
+### 3.5. `docker-yolo.yml`
+
+```yaml
+name: ia-yolo
+
+services:
+  yolo:
+    build:
+      context: ./build/yolo
+    image: ia/yolo:local
+    container_name: yolo
+    restart: unless-stopped
+    ports:
+      - "${YOLO_PORT:-5000}:5000"
+    volumes:
+      - ${DATA_DIR}/yolo/models:/data/models
+      - ${DATA_DIR}/yolo/dataset:/data/dataset
+    environment:
+      TZ: ${TZ}
+      YOLO_MODEL: ${YOLO_MODEL:-yolo11n.pt}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - red-ia
+
+networks:
+  red-ia:
+    external: true
+    name: red-ia
+```
+
+### 3.6. `docker-openwebui.yml`
+
+```yaml
+name: ia-openwebui
+
+services:
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:${OPENWEBUI_TAG:-cuda}
+    container_name: openwebui
+    restart: unless-stopped
+    ports:
+      - "${OPENWEBUI_PORT:-3000}:8080"
+    volumes:
+      - ${DATA_DIR}/openwebui:/app/backend/data
+    environment:
+      TZ: ${TZ}
+      WEBUI_NAME: ${WEBUI_NAME}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+      ENABLE_SIGNUP: ${ENABLE_SIGNUP:-true}
+      # --- Ollama ---
+      ENABLE_OLLAMA_API: "true"
+      OLLAMA_BASE_URL: http://ollama:11434
+      # --- Búsqueda web con SearXNG ---
+      ENABLE_WEB_SEARCH: "true"
+      WEB_SEARCH_ENGINE: searxng
+      SEARXNG_QUERY_URL: http://searxng:8080/search?q=<query>
+      # --- Generación de imágenes con ComfyUI ---
+      ENABLE_IMAGE_GENERATION: "true"
+      IMAGE_GENERATION_ENGINE: comfyui
+      COMFYUI_BASE_URL: http://comfyui:8188
+      # --- RAG: Qdrant como base vectorial, Ollama para embeddings ---
+      VECTOR_DB: qdrant
+      QDRANT_URI: http://rag:6333
+      QDRANT_API_KEY: ${RAG_API_KEY}
+      RAG_EMBEDDING_ENGINE: ollama
+      RAG_EMBEDDING_MODEL: ${OLLAMA_EMBED_MODEL}
+      RAG_OLLAMA_BASE_URL: http://ollama:11434
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - red-ia
+
+networks:
+  red-ia:
+    external: true
+    name: red-ia
+```
+
+> Estas variables fijan la configuración **la primera vez** que arranca Open WebUI. Después, Open WebUI guarda los ajustes en su base de datos y los cambios se hacen desde *Panel de administración → Ajustes*. Si necesita que el valor de una variable vuelva a mandar, añada `ENABLE_PERSISTENT_CONFIG: "false"`.
+
+### 3.7. `docker-hermes-agent.yml`
+
+```yaml
+name: ia-hermes-agent
+
+services:
+  hermes-agent:
+    image: nousresearch/hermes-agent:${HERMES_TAG:-latest}
+    container_name: hermes-agent
+    restart: unless-stopped
+    command: gateway run
+    ports:
+      - "${HERMES_PORT:-8000}:8000"
+    volumes:
+      - ${DATA_DIR}/hermes:/opt/data
+    environment:
+      TZ: ${TZ}
+      # Motor LLM: Ollama mediante su API compatible con OpenAI
+      OPENAI_BASE_URL: http://ollama:11434/v1
+      OPENAI_API_KEY: ollama
+      # Servidor API del agente (ver nota en la sección 6.5 si cambia en su versión)
+      API_SERVER_ENABLED: "true"
+      API_SERVER_HOST: 0.0.0.0
+      API_SERVER_PORT: "8000"
+      API_SERVER_KEY: ${HERMES_API_KEY}
+    networks:
+      red-ia:
+        aliases:
+          - hermesagent
+
+networks:
+  red-ia:
+    external: true
+    name: red-ia
+```
+
+### 3.8. `docker-opencode.yml`
+
+```yaml
+name: ia-opencode
+
+services:
+  opencode:
+    build:
+      context: ./build/opencode
+      args:
+        OPENCODE_VERSION: ${OPENCODE_VERSION:-latest}
+    image: ia/opencode:local
+    container_name: opencode
+    restart: unless-stopped
+    working_dir: /workspace
+    command: ["web", "--hostname", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "${OPENCODE_PORT:-8443}:8080"
+    volumes:
+      - ${DATA_DIR}/opencode/workspace:/workspace
+      - ${DATA_DIR}/opencode/config:/root/.config/opencode
+      - ${DATA_DIR}/opencode/share:/root/.local/share/opencode
+    environment:
+      TZ: ${TZ}
+      OPENCODE_SERVER_USERNAME: ${OPENCODE_SERVER_USERNAME:-opencode}
+      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD}
+    networks:
+      - red-ia
+
+networks:
+  red-ia:
+    external: true
+    name: red-ia
+```
+
+> **Aviso:** el puerto 8443 se usa por convención de la especificación, pero **OpenCode sirve HTTP, no HTTPS**. Para exponerlo fuera de su red local debe ponerle delante un proxy inverso con TLS (Caddy, Nginx o Traefik).
+
+### 3.9. Ficheros de construcción (Dockerfile)
+
+Tres servicios no tienen una imagen oficial lista para usar con la configuración que necesitamos y se construyen localmente.
+
+**`~/proyecto/build/comfyui/Dockerfile`**
+
+```dockerfile
+ARG PYTORCH_IMAGE=pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
+FROM ${PYTORCH_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git libgl1 libglib2.0-0 \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git . \
+ && pip install --no-cache-dir -r requirements.txt
+
+EXPOSE 8188
+CMD ["python", "main.py", "--listen", "0.0.0.0", "--port", "8188"]
+```
+
+**`~/proyecto/build/opencode/Dockerfile`**
+
+```dockerfile
+FROM node:22-bookworm-slim
+
+ARG OPENCODE_VERSION=latest
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && npm install -g opencode-ai@${OPENCODE_VERSION}
+
+WORKDIR /workspace
+EXPOSE 8080
+ENTRYPOINT ["opencode"]
+CMD ["web", "--hostname", "0.0.0.0", "--port", "8080"]
+```
+
+Se incluye `git` porque la interfaz web de OpenCode lo necesita para trabajar con proyectos, y `node` porque algunas integraciones (servidores MCP, sección 7.7) se ejecutan con `npx`.
+
+**`~/proyecto/build/yolo/Dockerfile`**
+
+```dockerfile
+FROM ultralytics/ultralytics:latest
+
+WORKDIR /app
+RUN pip install --no-cache-dir fastapi "uvicorn[standard]" python-multipart
+COPY app/ /app/
+
+EXPOSE 5000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5000"]
+```
+
+**`~/proyecto/build/yolo/app/main.py`** (API REST mínima de detección)
+
+```python
+import io
+import os
+import time
+
+import torch
+from fastapi import FastAPI, File, UploadFile
+from PIL import Image
+from ultralytics import YOLO
+
+MODEL_NAME = os.getenv("YOLO_MODEL", "yolo11n.pt")
+
+# Los pesos se descargan la primera vez en /data/models (volumen persistente)
+os.makedirs("/data/models", exist_ok=True)
+os.makedirs("/data/dataset", exist_ok=True)
+os.chdir("/data/models")
+
+DEVICE = 0 if torch.cuda.is_available() else "cpu"
+model = YOLO(MODEL_NAME)
+
+app = FastAPI(title="YOLO API", version="1.0")
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "model": MODEL_NAME,
+        "cuda": torch.cuda.is_available(),
+        "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+    }
+
+
+@app.post("/detect")
+async def detect(file: UploadFile = File(...), conf: float = 0.25, save: bool = False):
+    raw = await file.read()
+    image = Image.open(io.BytesIO(raw)).convert("RGB")
+
+    if save:
+        name = f"{int(time.time())}_{os.path.basename(file.filename or 'imagen.jpg')}"
+        with open(os.path.join("/data/dataset", name), "wb") as f:
+            f.write(raw)
+
+    result = model.predict(image, conf=conf, device=DEVICE, verbose=False)[0]
+    detections = [
+        {
+            "clase": result.names[int(box.cls)],
+            "confianza": round(float(box.conf), 4),
+            "caja_xyxy": [round(v, 1) for v in box.xyxy[0].tolist()],
+        }
+        for box in result.boxes
+    ]
+    return {"total": len(detections), "detecciones": detections}
+```
+
+### 3.10. Ficheros auxiliares de configuración
+
+**SearXNG: `~/searxng/config/settings.yml`**
+
+Open WebUI consume SearXNG en formato JSON, que viene **desactivado** por defecto. Sin este fichero, las búsquedas desde Open WebUI fallan con error 403.
+
+```yaml
+use_default_settings: true
+
+server:
+  secret_key: "__SEARXNG_SECRET__"
+  limiter: false
+  image_proxy: true
+
+search:
+  formats:
+    - html
+    - json
+```
+
+El marcador `__SEARXNG_SECRET__` lo sustituye `init.sh`.
+
+**OpenCode: `~/opencode/config/opencode.json`**
+
+Conecta OpenCode con los modelos de Ollama y con SearXNG (como servidor MCP):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama (local)",
+      "options": {
+        "baseURL": "http://ollama:11434/v1"
+      },
+      "models": {
+        "qwen2.5-coder:7b": { "name": "Qwen2.5 Coder 7B" },
+        "llama3.1:8b": { "name": "Llama 3.1 8B" }
+      }
+    }
+  },
+  "mcp": {
+    "searxng": {
+      "type": "local",
+      "command": ["npx", "-y", "mcp-searxng"],
+      "environment": {
+        "SEARXNG_URL": "http://searxng:8080"
+      },
+      "enabled": true
+    }
+  }
+}
+```
+
+---
+
+## 4. Fichero de entorno `.env`
+
+Cree `~/proyecto/.env` con este contenido. Las contraseñas aparecen como `__GENERAR__` y el script `init.sh` (sección 5.1) las sustituye por valores aleatorios. `__HOME__` se sustituye por su directorio personal.
+
+```bash
+nano ~/proyecto/.env
+```
+
+```ini
+# =====================================================================
+# .env - Pila de IA local (un único fichero para todos los servicios)
+# Regla: los valores con espacios van siempre entre comillas.
+# =====================================================================
+
+# ---------- General ----------
+TZ=Europe/Madrid
+# Raíz de los volúmenes de datos (por defecto, el directorio personal)
+DATA_DIR=__HOME__
+PROJECT_DIR=__HOME__/proyecto
+NETWORK_NAME=red-ia
+
+# ---------- Ollama ----------
+OLLAMA_TAG=latest
+OLLAMA_PORT=11434
+# Tiempo que un modelo permanece en VRAM sin uso (libera GPU para ComfyUI/YOLO)
+OLLAMA_KEEP_ALIVE=5m
+# Con 6-8 GB de VRAM, un solo modelo cargado a la vez
+OLLAMA_MAX_LOADED_MODELS=1
+OLLAMA_NUM_PARALLEL=1
+OLLAMA_FLASH_ATTENTION=1
+# Contexto en tokens: mayor valor = más VRAM. OpenCode y Hermes necesitan >= 8192
+OLLAMA_CONTEXT_LENGTH=8192
+# Modelos recomendados (se descargan en la sección 5.5)
+OLLAMA_CHAT_MODEL=llama3.1:8b
+OLLAMA_CODE_MODEL=qwen2.5-coder:7b
+OLLAMA_EMBED_MODEL=nomic-embed-text
+
+# ---------- Open WebUI ----------
+# "cuda" = versión con soporte GPU
+OPENWEBUI_TAG=cuda
+OPENWEBUI_PORT=3000
+WEBUI_NAME="IA Local"
+WEBUI_SECRET_KEY=__GENERAR__
+# Dejar en true para crear el administrador; cambiar a false después (sección 7.1)
+ENABLE_SIGNUP=true
+
+# ---------- Hermes Agent ----------
+HERMES_TAG=latest
+HERMES_PORT=8000
+HERMES_API_KEY=__GENERAR__
+
+# ---------- OpenCode ----------
+# "latest" o una versión concreta, p. ej. 1.15.0
+OPENCODE_VERSION=latest
+OPENCODE_PORT=8443
+OPENCODE_SERVER_USERNAME=opencode
+OPENCODE_SERVER_PASSWORD=__GENERAR__
+
+# ---------- ComfyUI ----------
+COMFYUI_PORT=8188
+COMFYUI_PYTORCH_IMAGE=pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
+# Para 6 GB de VRAM: --lowvram. Para 8 GB suele bastar dejarlo vacío o usar --normalvram
+COMFYUI_EXTRA_ARGS="--lowvram"
+
+# ---------- YOLO ----------
+YOLO_PORT=5000
+# yolo11n.pt (rápido) | yolo11s.pt | yolo11m.pt (más preciso, más VRAM)
+YOLO_MODEL=yolo11n.pt
+
+# ---------- SearXNG ----------
+SEARXNG_TAG=latest
+SEARXNG_PORT=8080
+SEARXNG_BASE_URL=http://localhost:8080/
+SEARXNG_SECRET=__GENERAR__
+
+# ---------- RAG (Qdrant) ----------
+RAG_TAG=latest
+RAG_PORT=6333
+RAG_GRPC_PORT=6334
+RAG_API_KEY=__GENERAR__
+```
+
+Proteja el fichero (contiene contraseñas):
+
+```bash
+chmod 600 ~/proyecto/.env
+```
+
+### 4.1. Tabla de puertos (verificación del criterio 3)
+
+| Puerto host | Servicio |
+| :---: | :--- |
+| 3000 | Open WebUI |
+| 5000 | YOLO |
+| 6333 | RAG (Qdrant REST) |
+| 6334 | RAG (Qdrant gRPC) |
+| 8000 | Hermes Agent |
+| 8080 | SearXNG |
+| 8188 | ComfyUI |
+| 8443 | OpenCode |
+| 11434 | Ollama |
+
+Ningún puerto del host se repite. Los puertos internos 8080 de Open WebUI, OpenCode y SearXNG no colisionan porque cada contenedor tiene su propia red interna; solo SearXNG publica el 8080 en el host.
+
+---
+## 5. Despliegue y verificación
+
+### 5.1. Scripts de operación
+
+Cree los seis scripts en `~/proyecto/scripts/`. Se pegan con `nano ~/proyecto/scripts/<nombre>.sh`.
+
+**`init.sh`**: prepara rutas, contraseñas y permisos (se ejecuta una sola vez)
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+[ -f .env ] || { echo "ERROR: falta el fichero .env"; exit 1; }
+
+# 1) Sustituir __HOME__ por la ruta real
+sed -i "s|__HOME__|$HOME|g" .env
+
+# 2) Generar contraseñas aleatorias donde haya marcador
+for key in WEBUI_SECRET_KEY HERMES_API_KEY OPENCODE_SERVER_PASSWORD SEARXNG_SECRET RAG_API_KEY; do
+  if grep -q "^${key}=__GENERAR__" .env; then
+    sed -i "s|^${key}=__GENERAR__|${key}=$(openssl rand -hex 24)|" .env
+  fi
+done
+
+# 3) Cargar variables
+set -a; source .env; set +a
+
+# 4) Clave secreta de SearXNG en su settings.yml
+SETTINGS="$DATA_DIR/searxng/config/settings.yml"
+if [ -f "$SETTINGS" ]; then
+  sed -i "s|__SEARXNG_SECRET__|$SEARXNG_SECRET|" "$SETTINGS"
+else
+  echo "AVISO: no existe $SETTINGS (créelo según la sección 3.10)"
+fi
+
+# 5) Permisos: SearXNG corre con el usuario 977 dentro del contenedor
+sudo chown -R 977:977 "$DATA_DIR/searxng"
+
+chmod 600 .env
+chmod +x scripts/*.sh
+
+# 6) Red Docker
+docker network inspect "$NETWORK_NAME" >/dev/null 2>&1 \
+  || docker network create --driver bridge "$NETWORK_NAME"
+
+echo "Inicialización completada."
+```
+
+**`up.sh`**: arranca todo en el orden correcto
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+set -a; source .env; set +a
+
+docker network inspect "$NETWORK_NAME" >/dev/null 2>&1 \
+  || docker network create --driver bridge "$NETWORK_NAME"
+
+dc() { local svc="$1"; shift; docker compose -f "docker-${svc}.yml" --env-file .env "$@"; }
+
+echo ">> Arrancando ollama (base de todo)"
+dc ollama up -d
+echo -n "   Esperando a que Ollama esté listo"
+for _ in $(seq 1 40); do
+  state=$(docker inspect -f '{{.State.Health.Status}}' ollama 2>/dev/null || echo none)
+  [ "$state" = "healthy" ] && break
+  echo -n "."; sleep 3
+done
+echo
+
+# Orden: primero lo que otros consumen, al final los que consumen
+for svc in rag searxng comfyui yolo openwebui hermes-agent opencode; do
+  echo ">> Arrancando $svc"
+  dc "$svc" up -d --build
+done
+
+echo
+docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+```
+
+**`down.sh`**: para todo en orden inverso (los datos NO se borran)
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+for svc in opencode hermes-agent openwebui yolo comfyui searxng rag ollama; do
+  echo ">> Parando $svc"
+  docker compose -f "docker-${svc}.yml" --env-file .env down
+done
+```
+
+**`test.sh`**: pruebas de humo
+
+```bash
+#!/usr/bin/env bash
+cd "$(dirname "$0")/.."
+set -a; source .env; set +a
+FAIL=0
+ok() { printf '[ OK  ] %s\n' "$1"; }
+ko() { printf '[FALLO] %s\n' "$1"; FAIL=1; }
+http() { local n="$1" u="$2"; shift 2
+  if curl -fsS -m 15 -o /dev/null "$@" "$u"; then ok "$n -> $u"; else ko "$n -> $u"; fi; }
+
+echo "== 1. Contenedores en ejecución =="
+for c in ollama rag searxng comfyui yolo openwebui hermes-agent opencode; do
+  if [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" = "true" ]; then ok "$c"; else ko "$c no está en ejecución"; fi
+done
+
+echo "== 2. Servicios HTTP desde el host =="
+http Ollama    "http://localhost:${OLLAMA_PORT}/api/tags"
+http OpenWebUI "http://localhost:${OPENWEBUI_PORT}/health"
+http ComfyUI   "http://localhost:${COMFYUI_PORT}/system_stats"
+http YOLO      "http://localhost:${YOLO_PORT}/health"
+http SearXNG   "http://localhost:${SEARXNG_PORT}/search?q=prueba&format=json"
+http RAG       "http://localhost:${RAG_PORT}/collections" -H "api-key: ${RAG_API_KEY}"
+http OpenCode  "http://localhost:${OPENCODE_PORT}/" -u "${OPENCODE_SERVER_USERNAME}:${OPENCODE_SERVER_PASSWORD}"
+
+echo "== 3. GPU visible dentro de los contenedores =="
+for c in ollama comfyui yolo openwebui; do
+  if docker exec "$c" nvidia-smi -L >/dev/null 2>&1; then ok "$c ve la GPU"; else ko "$c NO ve la GPU"; fi
+done
+if curl -fsS "http://localhost:${YOLO_PORT}/health" | grep -q '"cuda":true'; then ok "YOLO usa CUDA"; else ko "YOLO no usa CUDA"; fi
+
+echo "== 4. DNS interno de red-ia =="
+if docker exec openwebui python3 -c "import urllib.request as u;u.urlopen('http://ollama:11434/api/tags',timeout=10)" 2>/dev/null; then ok "openwebui -> ollama"; else ko "openwebui -> ollama"; fi
+if docker exec openwebui python3 -c "import urllib.request as u;u.urlopen('http://searxng:8080/search?q=a&format=json',timeout=20)" 2>/dev/null; then ok "openwebui -> searxng"; else ko "openwebui -> searxng"; fi
+if docker exec openwebui python3 -c "import urllib.request as u;u.urlopen('http://comfyui:8188/system_stats',timeout=10)" 2>/dev/null; then ok "openwebui -> comfyui"; else ko "openwebui -> comfyui"; fi
+if docker exec opencode curl -fsS -m 10 -o /dev/null http://ollama:11434/api/tags; then ok "opencode -> ollama"; else ko "opencode -> ollama"; fi
+if docker exec opencode curl -fsS -m 20 -o /dev/null "http://searxng:8080/search?q=a&format=json"; then ok "opencode -> searxng"; else ko "opencode -> searxng"; fi
+
+echo
+[ "$FAIL" -eq 0 ] && echo "RESULTADO: todo correcto" || echo "RESULTADO: hay fallos (revise los logs: docker logs <contenedor>)"
+exit "$FAIL"
+```
+
+**`backup.sh`**: copia de seguridad (ver sección 6.2)
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+set -a; source .env; set +a
+
+DEST="$PROJECT_DIR/backups"
+STAMP=$(date +%F_%H%M)
+mkdir -p "$DEST"
+
+# Parar los servicios que escriben bases de datos para obtener una copia consistente
+restart() { docker start openwebui rag >/dev/null 2>&1 || true; }
+trap restart EXIT
+docker stop openwebui rag >/dev/null 2>&1 || true
+
+# Datos (se excluyen los modelos: pesan mucho y se pueden volver a descargar)
+tar czf "$DEST/ia-datos_${STAMP}.tar.gz" -C "$DATA_DIR" \
+  --exclude='ollama/models' --exclude='comfyui/models' \
+  openwebui hermes opencode comfyui yolo searxng rag ollama
+
+# Configuración del stack
+tar czf "$DEST/ia-config_${STAMP}.tar.gz" -C "$PROJECT_DIR" \
+  .env docker-*.yml build scripts
+
+# Rotación: borrar copias de más de 14 días
+find "$DEST" -name 'ia-*.tar.gz' -mtime +14 -delete
+
+echo "Copias creadas en $DEST:"
+ls -lh "$DEST" | tail -n 5
+```
+
+**`update.sh`**: actualización de servicios (ver sección 6.3)
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+set -a; source .env; set +a
+dc() { local svc="$1"; shift; docker compose -f "docker-${svc}.yml" --env-file .env "$@"; }
+
+SERVICIOS_IMAGEN="${*:-ollama rag searxng openwebui hermes-agent}"
+SERVICIOS_BUILD="${BUILD_SERVICES:-comfyui yolo opencode}"
+
+for svc in $SERVICIOS_IMAGEN; do
+  echo ">> Actualizando $svc"; dc "$svc" pull; dc "$svc" up -d
+done
+for svc in $SERVICIOS_BUILD; do
+  echo ">> Reconstruyendo $svc"; dc "$svc" build --pull; dc "$svc" up -d
+done
+
+docker image prune -f
+docker ps --format 'table {{.Names}}\t{{.Status}}'
+```
+
+### 5.2. Puesta en marcha paso a paso
+
+```bash
+# 1) Dar permisos de ejecución e inicializar (rutas, contraseñas, permisos)
+chmod +x ~/proyecto/scripts/*.sh
+~/proyecto/scripts/init.sh
+
+# 2) Revisar que no queden marcadores sin sustituir
+grep -n "__" ~/proyecto/.env        # no debe devolver nada
+
+# 3) Validar la sintaxis de los ficheros (criterio de aceptación 1)
+cd ~/proyecto
+for f in docker-*.yml; do
+  docker compose -f "$f" --env-file .env config -q && echo "OK  $f" || echo "ERROR $f"
+done
+
+# 4) Arrancar todo
+./scripts/up.sh
+```
+
+> **La primera vez tarda bastante** (10-30 minutos): descarga imágenes de varios GB y construye ComfyUI, YOLO y OpenCode. Es normal. Puede seguir el progreso en otra terminal con `docker ps` y `docker logs -f <contenedor>`.
+
+### 5.3. Descargar los modelos de lenguaje
+
+Ollama arranca vacío. Descargue los modelos definidos en `.env`:
+
+```bash
+docker exec -it ollama ollama pull llama3.1:8b          # chat general
+docker exec -it ollama ollama pull qwen2.5-coder:7b     # programación (OpenCode)
+docker exec -it ollama ollama pull nomic-embed-text     # embeddings para RAG
+
+# Listar lo descargado
+docker exec ollama ollama list
+```
+
+Cada modelo de 7-8B ocupa entre 4 y 5 GB. Con 6 GB de VRAM, si el modelo va lento, pruebe `llama3.2:3b`.
+
+### 5.4. Configuración inicial de Hermes Agent
+
+Hermes necesita un asistente de configuración una sola vez, para indicarle qué motor LLM usar:
+
+```bash
+cd ~/proyecto
+docker compose -f docker-hermes-agent.yml --env-file .env run --rm -it hermes-agent setup
+```
+
+Cuando pregunte por el proveedor, elija **custom endpoint** (o la opción de Ollama si aparece) e indique:
+
+- URL: `http://ollama:11434/v1`
+- Clave API: `ollama` (cualquier texto; Ollama no la valida)
+- Modelo: `llama3.1:8b`
+
+Después reinicie el servicio:
+
+```bash
+docker compose -f docker-hermes-agent.yml --env-file .env up -d --force-recreate
+```
+
+Los ajustes quedan guardados en `~/hermes` (volumen persistente).
+
+### 5.5. Comprobar el estado y los logs
+
+```bash
+# Estado de todos los contenedores
+docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+
+# Logs de un servicio (Ctrl+C para salir)
+docker logs -f ollama
+docker logs --tail 100 openwebui
+docker logs --since 10m comfyui
+
+# Logs de varios servicios a la vez
+for c in ollama openwebui searxng; do echo "=== $c ==="; docker logs --tail 20 $c; done
+
+# Consumo de CPU y RAM por contenedor
+docker stats --no-stream
+```
+
+Una señal de salud: el estado debe ser `Up ... (healthy)` en Ollama y Open WebUI, y `Up` en el resto. Si un contenedor aparece como `Restarting`, lea sus logs: casi siempre explican el motivo.
+
+### 5.6. Acceso a las URL de los servicios
+
+Averigüe la IP del servidor con `hostname -I`. Sustituya `IP` por ese valor (o `localhost` si trabaja en el propio servidor).
+
+| Servicio | URL desde el navegador | Primer acceso |
+| :--- | :--- | :--- |
+| Open WebUI | `http://IP:3000` | Crear la cuenta de administrador (el primer usuario registrado lo es) |
+| Hermes Agent | `http://IP:8000` | API del agente; se usa desde clientes o desde Open WebUI (sección 7.8) |
+| OpenCode | `http://IP:8443` | Usuario `opencode` y la contraseña `OPENCODE_SERVER_PASSWORD` del `.env` |
+| ComfyUI | `http://IP:8188` | Sin usuario; carga el editor de nodos |
+| YOLO | `http://IP:5000/docs` | Documentación interactiva de la API (Swagger) |
+| SearXNG | `http://IP:8080` | Buscador; sin usuario |
+| Ollama | `http://IP:11434` | Responde "Ollama is running" |
+| RAG (Qdrant) | `http://IP:6333/dashboard` | Pide la clave `RAG_API_KEY` |
+
+Para ver una contraseña del `.env`: `grep OPENCODE_SERVER_PASSWORD ~/proyecto/.env`.
+
+### 5.7. Verificar el uso de la GPU
+
+```bash
+# Estado de la GPU en el host (refresco cada segundo; Ctrl+C para salir)
+watch -n 1 nvidia-smi
+
+# La GPU es visible desde cada contenedor
+docker exec ollama nvidia-smi -L
+docker exec comfyui nvidia-smi -L
+docker exec yolo nvidia-smi -L
+
+# Ollama: ¿el modelo está en GPU? La columna PROCESSOR debe decir "100% GPU"
+docker exec ollama ollama run llama3.1:8b "Responde solo: hola"
+docker exec ollama ollama ps
+
+# YOLO: CUDA disponible
+curl -s http://localhost:5000/health | jq
+
+# ComfyUI: debe aparecer "Device: cuda:0 ..." en el arranque
+docker logs comfyui 2>&1 | grep -i "device"
+```
+
+Mientras Ollama responde, `nvidia-smi` debe mostrar el proceso `ollama` consumiendo memoria de la GPU. Si `ollama ps` indica `100% CPU` o un reparto (por ejemplo `40%/60% CPU/GPU`), el modelo no cabe entero en VRAM: use uno más pequeño o reduzca `OLLAMA_CONTEXT_LENGTH`.
+
+### 5.8. Pruebas de humo completas
+
+```bash
+~/proyecto/scripts/test.sh
+```
+
+Debe terminar con `RESULTADO: todo correcto`. Cada línea `[FALLO]` indica qué comprobar (ver sección 6.4).
+
+**Prueba funcional de YOLO** (necesita cualquier foto, por ejemplo `foto.jpg`):
+
+```bash
+curl -s -X POST "http://localhost:5000/detect?conf=0.3" -F "file=@foto.jpg" | jq
+```
+
+**Prueba funcional de RAG:**
+
+```bash
+curl -s -H "api-key: $(grep ^RAG_API_KEY ~/proyecto/.env | cut -d= -f2)" http://localhost:6333/collections | jq
+```
+
+---
+
+## 6. Mantenimiento y actualización
+
+### 6.1. Operaciones habituales
+
+```bash
+cd ~/proyecto
+
+# Parar / arrancar un servicio concreto
+docker compose -f docker-openwebui.yml --env-file .env stop
+docker compose -f docker-openwebui.yml --env-file .env start
+
+# Recrear un servicio tras cambiar su .yml o el .env
+docker compose -f docker-openwebui.yml --env-file .env up -d --force-recreate
+
+# Reiniciar un contenedor
+docker restart ollama
+
+# Parar / arrancar toda la pila
+./scripts/down.sh
+./scripts/up.sh
+
+# Shell dentro de un contenedor
+docker exec -it ollama bash
+```
+
+Los datos **no se pierden** al hacer `down` o `up`: viven en `~/ollama`, `~/openwebui`, etc. Solo se perderían si borra esas carpetas.
+
+### 6.2. Copias de seguridad
+
+```bash
+~/proyecto/scripts/backup.sh
+```
+
+Genera en `~/proyecto/backups/` dos ficheros: `ia-datos_FECHA.tar.gz` (chats, usuarios, vectores, workflows, proyectos de OpenCode...) e `ia-config_FECHA.tar.gz` (`.env`, ficheros `.yml`, Dockerfiles y scripts). Los modelos de Ollama y ComfyUI se excluyen porque ocupan decenas de GB y se pueden volver a descargar.
+
+> Las copias contienen contraseñas (`.env`). Guárdelas en un lugar protegido y **sáquelas del servidor**: una copia en el mismo disco no protege de un fallo del disco.
+
+**Automatizar cada noche a las 03:00:**
+
+```bash
+crontab -e
+# Añadir esta línea:
+0 3 * * * /home/USUARIO/proyecto/scripts/backup.sh >> /home/USUARIO/proyecto/backups/backup.log 2>&1
+```
+
+**Copiar a otra máquina:**
+
+```bash
+rsync -av ~/proyecto/backups/ usuario@servidor-backup:/ruta/backups-ia/
+```
+
+**Restaurar:**
+
+```bash
+cd ~/proyecto && ./scripts/down.sh
+tar xzf backups/ia-datos_FECHA.tar.gz -C "$HOME"
+tar xzf backups/ia-config_FECHA.tar.gz -C ~/proyecto
+./scripts/up.sh
+```
+
+### 6.3. Actualización de servicios
+
+Antes de actualizar, haga una copia de seguridad.
+
+```bash
+~/proyecto/scripts/backup.sh
+~/proyecto/scripts/update.sh                 # actualiza todos
+~/proyecto/scripts/update.sh openwebui       # actualiza solo uno de los de imagen
+```
+
+- **Servicios con imagen publicada** (`ollama`, `rag`, `searxng`, `openwebui`, `hermes-agent`): `pull` descarga la imagen nueva y `up -d` recrea el contenedor.
+- **Servicios construidos localmente** (`comfyui`, `yolo`, `opencode`): `build --pull` reconstruye la imagen con la última versión del código.
+
+**Actualizar modelos de Ollama:**
+
+```bash
+docker exec ollama ollama pull llama3.1:8b
+```
+
+**Fijar versiones (recomendado en producción):** cambie `latest` por una versión concreta en el `.env` (`OLLAMA_TAG=0.12.0`, `OPENCODE_VERSION=1.15.0`...) para que una actualización no le sorprenda con cambios incompatibles. Compruebe las versiones disponibles en la página de cada proyecto.
+
+**Volver atrás si algo falla:** ponga la versión anterior en el `.env`, ejecute `docker compose -f docker-<servicio>.yml --env-file .env up -d` y, si hace falta, restaure los datos.
+
+**Limpieza de espacio:**
+
+```bash
+docker image prune -f            # imágenes sin usar
+docker builder prune -f          # caché de construcción
+docker system df                 # ver qué ocupa Docker
+df -h /                          # espacio en disco
+```
+
+### 6.4. Resolución de errores comunes
+
+| Síntoma | Causa probable | Solución |
+| :--- | :--- | :--- |
+| `permission denied while trying to connect to the Docker daemon` | Su usuario no está en el grupo `docker` | `sudo usermod -aG docker $USER`, cierre sesión y vuelva a entrar |
+| `could not select device driver "" with capabilities: [[gpu]]` | NVIDIA Container Toolkit sin configurar | Repita la sección 1.6: `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker` |
+| `nvidia-smi` funciona en el host pero no en el contenedor | El runtime no está registrado o Docker no se reinició | `cat /etc/docker/daemon.json` debe contener `nvidia`; reinicie Docker |
+| `Bind for 0.0.0.0:XXXX failed: port is already allocated` | Otro programa usa ese puerto | `sudo ss -ltnp \| grep :XXXX` para ver quién; cambie el puerto en el `.env` |
+| `network red-ia declared as external, but could not be found` | Falta crear la red | `docker network create --driver bridge red-ia` |
+| Open WebUI no ve los modelos | No alcanza a Ollama o no hay modelos | `docker exec ollama ollama list`; compruebe `OLLAMA_BASE_URL` en Ajustes → Conexiones |
+| Búsqueda web en Open WebUI da error 403 | SearXNG no tiene el formato JSON habilitado | Revise `search.formats` en `~/searxng/config/settings.yml` y reinicie `searxng` |
+| SearXNG: `Permission denied` o bucle de reinicios | El usuario 977 del contenedor no puede escribir | `sudo chown -R 977:977 ~/searxng` y reinicie |
+| Un contenedor no puede escribir en su carpeta de datos | La carpeta pertenece a otro usuario | Ver "Arreglar permisos" más abajo |
+| `CUDA out of memory` (ComfyUI, YOLO, Ollama) | Varios servicios compiten por la VRAM | Ver apéndice A; descargue modelos de Ollama con `docker exec ollama ollama stop <modelo>` |
+| Ollama responde muy lento | El modelo corre en CPU | `docker exec ollama ollama ps`; use un modelo menor |
+| ComfyUI arranca pero no encuentra modelos | Las carpetas de `~/comfyui/models` están vacías | Descargue un *checkpoint* en `~/comfyui/models/checkpoints/` y pulse "Refresh" en ComfyUI |
+| OpenCode abre pero no ve el proyecto | Se abrió con un directorio de trabajo distinto | Trabaje dentro de `~/opencode/workspace` y confirme `working_dir: /workspace` en el `.yml` |
+| Tras un reinicio del servidor no arranca nada | Docker no está habilitado en el arranque | `sudo systemctl enable docker` (los contenedores tienen `restart: unless-stopped`) |
+
+**Arreglar permisos de los volúmenes:**
+
+```bash
+# Ver quién es el propietario
+ls -ld ~/ollama ~/openwebui ~/hermes ~/opencode ~/comfyui ~/yolo ~/searxng ~/rag
+
+# Los contenedores de este manual escriben como root salvo SearXNG (977).
+# Si alguna carpeta quedó con otro propietario por haberla creado con sudo:
+sudo chown -R $USER:$USER ~/openwebui ~/opencode ~/comfyui ~/yolo ~/rag ~/ollama
+sudo chown -R 977:977 ~/searxng
+
+# Hermes: si el log indica "permission denied" sobre /opt/data,
+# compruebe con qué usuario corre el contenedor y ajuste el propietario:
+docker exec hermes-agent id
+sudo chown -R <uid>:<gid> ~/hermes
+```
+
+Cuando los contenedores corren como `root` dentro (Ollama, Open WebUI, ComfyUI, OpenCode), los ficheros que crean en `~/ollama`, etc. pertenecen a `root` en el host. Para editarlos como usuario normal use `sudo`.
+
+**Diagnóstico general en tres pasos:**
+
+```bash
+docker ps -a                          # 1) ¿Está en ejecución o salió?
+docker logs --tail 100 <contenedor>   # 2) ¿Qué dice el error?
+docker inspect <contenedor> | jq '.[0].State'   # 3) Código de salida y reinicios
+```
+
+### 6.5. Hermes Agent y OpenCode: cómo comprobar parámetros si cambian
+
+Estos dos proyectos se actualizan con frecuencia. Si tras una actualización un servicio no arranca:
+
+```bash
+# Hermes: diagnóstico integrado
+docker exec hermes-agent hermes doctor
+docker exec hermes-agent hermes --version
+
+# OpenCode: versión y ayuda del modo web
+docker exec opencode opencode --version
+docker exec opencode opencode web --help
+```
+
+- **Hermes Agent.** La imagen `nousresearch/hermes-agent` guarda su configuración en `/opt/data` y se inicia con `gateway run`. Las variables `API_SERVER_*` activan un servidor HTTP compatible con la API de OpenAI; si su versión usa otros nombres o otro puerto por defecto, consulte la documentación del proyecto (`hermes doctor` suele indicar qué falta) y ajuste el mapeo `HERMES_PORT:8000` del `.yml`.
+- **OpenCode.** Se instala con `npm install -g opencode-ai` y la interfaz web se lanza con `opencode web`. La autenticación se activa con `OPENCODE_SERVER_PASSWORD`.
+
+### 6.6. Seguridad básica
+
+- **Docker salta el cortafuegos `ufw`.** Los puertos publicados con `ports:` quedan accesibles desde la red aunque `ufw` los bloquee. Para que un servicio solo sea accesible desde el propio servidor, cambie el mapeo a `"127.0.0.1:11434:11434"` (por ejemplo, en Ollama, que no tiene autenticación).
+- **Nunca exponga Ollama, ComfyUI o YOLO directamente a Internet:** no tienen autenticación.
+- Para acceso remoto, ponga delante un proxy inverso con HTTPS (Caddy, Nginx Proxy Manager o Traefik) o use una VPN (WireGuard, Tailscale).
+- Tras crear el administrador de Open WebUI, ponga `ENABLE_SIGNUP=false` en el `.env` y recree el servicio, o desactive el registro en *Panel de administración → Ajustes → General*.
+- Mantenga el sistema actualizado: `sudo apt update && sudo apt upgrade -y`.
+
+---
+
+## 7. Guía interna de integración
+
+Todos los contenedores comparten la red `red-ia`, así que se localizan por su **nombre de contenedor** y el **puerto interno**. Nunca use `localhost` ni la IP del host para conectar un contenedor con otro: dentro de un contenedor, `localhost` es el propio contenedor.
+
+### 7.1. Mapa de conexiones
+
+| Origen | Destino | URL interna | Configuración |
+| :--- | :--- | :--- | :--- |
+| Open WebUI | Ollama | `http://ollama:11434` | Automática (variable `OLLAMA_BASE_URL`) |
+| Open WebUI | SearXNG | `http://searxng:8080/search?q=<query>` | Automática (variables `WEB_SEARCH_*`) |
+| Open WebUI | ComfyUI | `http://comfyui:8188` | Variable + subir un *workflow* en la interfaz (7.4) |
+| Open WebUI | RAG (Qdrant) | `http://rag:6333` | Automática (`VECTOR_DB=qdrant`) |
+| Open WebUI | Ollama (embeddings) | `http://ollama:11434` | Automática (`RAG_EMBEDDING_ENGINE=ollama`) |
+| Hermes Agent | Ollama | `http://ollama:11434/v1` | Asistente `setup` (5.4) |
+| OpenCode | Ollama | `http://ollama:11434/v1` | `opencode.json` (3.10) |
+| OpenCode | SearXNG | `http://searxng:8080` | Servidor MCP en `opencode.json` (7.7) |
+| Hermes Agent | SearXNG / ComfyUI | `http://searxng:8080`, `http://comfyui:8188` | Manual, según versión (7.8) |
+| Cualquier cliente | YOLO | `http://yolo:5000` | Llamadas REST (7.9) |
+
+**Prueba universal de conectividad** entre contenedores (sirve para cualquier pareja):
+
+```bash
+docker run --rm --network red-ia curlimages/curl -sS -m 10 http://ollama:11434/api/tags
+docker run --rm --network red-ia curlimages/curl -sS -m 10 http://yolo:5000/health
+```
+
+Si responde, la red y el DNS funcionan. Si falla con `Could not resolve host`, el contenedor destino no está en `red-ia` o no está en marcha.
+
+### 7.2. Ollama ↔ Open WebUI
+
+La conexión se establece sola mediante `OLLAMA_BASE_URL=http://ollama:11434`. Para verificarla:
+
+1. Entre en `http://IP:3000` y cree el administrador.
+2. Arriba a la izquierda, en el selector de modelo, deben aparecer `llama3.1:8b`, `qwen2.5-coder:7b`, etc.
+3. Si no aparecen: *Panel de administración → Ajustes → Conexiones* y compruebe que la URL de Ollama es `http://ollama:11434`. Pulse el icono de verificar.
+4. Para descargar modelos desde la propia interfaz: *Panel de administración → Ajustes → Modelos → Gestionar modelos de Ollama*.
+
+### 7.3. SearXNG ↔ Open WebUI (búsqueda web)
+
+Requisitos ya cubiertos: formato JSON habilitado en `settings.yml` (3.10) y las variables `WEB_SEARCH_ENGINE=searxng` y `SEARXNG_QUERY_URL` (3.6).
+
+1. Verifique la salida JSON desde el servidor: `curl -s "http://localhost:8080/search?q=prueba&format=json" | jq '.results | length'`. Debe devolver un número mayor que 0.
+2. En Open WebUI, vaya a *Panel de administración → Ajustes → Búsqueda web*: el motor debe ser `searxng` y la URL `http://searxng:8080/search?q=<query>`.
+3. En un chat, active el interruptor **Búsqueda web** (icono del globo) antes de escribir la pregunta.
+
+### 7.4. ComfyUI ↔ Open WebUI (generación de imágenes)
+
+La URL `http://comfyui:8188` ya está preconfigurada. Falta indicarle a Open WebUI **qué flujo de nodos** debe ejecutar:
+
+1. Descargue un *checkpoint* (por ejemplo, un modelo SDXL o SD 1.5) en `~/comfyui/models/checkpoints/`.
+2. Abra ComfyUI (`http://IP:8188`), cargue un flujo básico de texto a imagen y compruebe que genera una imagen.
+3. En ComfyUI, active *Ajustes → Habilitar opciones de desarrollo* y use **Save (API Format)** para exportar el flujo como JSON.
+4. En Open WebUI: *Panel de administración → Ajustes → Imágenes*. Motor `ComfyUI`, URL `http://comfyui:8188`, y pegue/suba el JSON del flujo.
+5. Asigne los nodos (texto del *prompt*, semilla, dimensiones, modelo) según indique la propia interfaz.
+6. En un chat, pulse el icono de imagen bajo una respuesta para generarla.
+
+### 7.5. RAG (Qdrant + Ollama) ↔ Open WebUI
+
+Open WebUI guarda los vectores en Qdrant (`http://rag:6333`) y Ollama calcula los embeddings con `nomic-embed-text`, de modo que el trabajo pesado usa GPU.
+
+1. Asegúrese de haber descargado el modelo de embeddings (5.3).
+2. En Open WebUI: *Espacio de trabajo → Conocimiento → Nuevo* y suba sus documentos (PDF, TXT, MD...).
+3. En un chat escriba `#` y elija esa colección de conocimiento, o asócielo a un modelo personalizado.
+4. Compruebe que se creó la colección en Qdrant: `curl -s -H "api-key: <RAG_API_KEY>" http://localhost:6333/collections | jq`.
+5. Guarde una copia de los documentos originales en `~/rag/docs/`: es solo su archivo de origen, Open WebUI no lee esa carpeta automáticamente.
+
+### 7.6. Ollama ↔ Hermes Agent
+
+Se configura con el asistente de la sección 5.4: URL `http://ollama:11434/v1`, modelo `llama3.1:8b`. Verificación:
+
+```bash
+docker exec hermes-agent hermes doctor
+docker logs --tail 30 hermes-agent
+```
+
+Los agentes de este tipo envían instrucciones largas, por lo que necesitan contexto amplio. Si el agente se queda sin memoria de conversación o pierde instrucciones, suba `OLLAMA_CONTEXT_LENGTH` (por ejemplo a 16384) en el `.env` y recree Ollama; recuerde que consume más VRAM.
+
+### 7.7. Ollama y SearXNG ↔ OpenCode
+
+Ambas conexiones están definidas en `~/opencode/config/opencode.json` (3.10):
+
+- **Ollama:** proveedor `ollama` con `baseURL` `http://ollama:11434/v1` y los modelos que desee exponer. Si añade un modelo nuevo a Ollama, añádalo también a la sección `models` del JSON usando el mismo nombre que muestra `ollama list`.
+- **SearXNG:** como OpenCode no trae buscador propio, se conecta a SearXNG mediante un servidor MCP (`mcp-searxng`) que se ejecuta con `npx` dentro del contenedor y apunta a `http://searxng:8080`. Se descarga la primera vez que se usa, por lo que el contenedor necesita salida a Internet.
+
+Verificación:
+
+```bash
+docker exec opencode curl -fsS http://ollama:11434/api/tags | head -c 200
+docker exec opencode curl -fsS "http://searxng:8080/search?q=test&format=json" | head -c 200
+docker restart opencode        # tras cualquier cambio en opencode.json
+```
+
+En `http://IP:8443`, elija el modelo `Qwen2.5 Coder 7B` del proveedor "Ollama (local)". Para código con herramientas, un modelo con contexto de 8192 tokens o más es el mínimo razonable.
+
+### 7.8. SearXNG, ComfyUI y Open WebUI ↔ Hermes Agent
+
+La especificación indica que Hermes depende de SearXNG y ComfyUI. Hermes los consume como herramientas externas; las direcciones que debe usar son siempre las internas:
+
+- Búsqueda web: `http://searxng:8080` (formato JSON ya habilitado).
+- Imágenes: `http://comfyui:8188`.
+
+La forma exacta de registrar estas herramientas (variable de entorno, fichero de configuración en `~/hermes` o comando `hermes config`) cambia entre versiones de Hermes. Consulte `docker exec hermes-agent hermes --help` y la documentación del proyecto, y use esas dos URL.
+
+**Usar Hermes desde Open WebUI** (si su versión de Hermes expone la API compatible con OpenAI en el puerto 8000): *Panel de administración → Ajustes → Conexiones → Añadir conexión de OpenAI* con URL `http://hermes-agent:8000/v1` y como clave el valor de `HERMES_API_KEY`.
+
+### 7.9. YOLO como servicio de visión
+
+YOLO expone una API REST que cualquier otro servicio o script puede llamar:
+
+```bash
+# Desde el host
+curl -s -X POST "http://localhost:5000/detect?conf=0.3&save=true" -F "file=@foto.jpg" | jq
+
+# Desde otro contenedor de la red (por ejemplo, un script en OpenCode)
+curl -s -X POST "http://yolo:5000/detect" -F "file=@/workspace/foto.jpg"
+```
+
+Con `save=true` la imagen analizada se guarda en `~/yolo/dataset/`. Respuesta típica:
+
+```json
+{ "total": 2, "detecciones": [
+  { "clase": "person", "confianza": 0.91, "caja_xyxy": [34.2, 10.5, 320.8, 478.0] },
+  { "clase": "dog",    "confianza": 0.77, "caja_xyxy": [350.1, 220.3, 590.0, 470.2] } ] }
+```
+
+La documentación interactiva está en `http://IP:5000/docs`.
+
+---
+
+## Apéndice A. Gestión de la VRAM con una GPU de 6-8 GB
+
+Cada servicio con GPU reserva memoria de vídeo. Orientación aproximada:
+
+| Servicio | VRAM típica | Cómo reducirla |
+| :--- | :--- | :--- |
+| Ollama, modelo 7-8B (cuantizado) | 5-6 GB + contexto | Modelo de 3B (`llama3.2:3b`, ~2-3 GB); bajar `OLLAMA_CONTEXT_LENGTH` |
+| ComfyUI, SDXL | 6-8 GB | `COMFYUI_EXTRA_ARGS="--lowvram"`; usar SD 1.5 (~4 GB) |
+| YOLO `yolo11n` | < 1 GB | Es el más ligero; `yolo11s`/`m` usan más |
+| Open WebUI (imagen `cuda`) | < 1 GB | Los embeddings los hace Ollama, no Open WebUI |
+
+**Regla práctica:** use un solo servicio pesado a la vez. `OLLAMA_KEEP_ALIVE=5m` libera la GPU cuando Ollama lleva 5 minutos sin recibir peticiones. Para liberarla de inmediato:
+
+```bash
+docker exec ollama ollama ps                 # ¿qué modelo está cargado?
+docker exec ollama ollama stop llama3.1:8b   # descargarlo de la VRAM
+```
+
+## Apéndice B. Chuleta de comandos
+
+| Tarea | Comando |
+| :--- | :--- |
+| Arrancar todo | `~/proyecto/scripts/up.sh` |
+| Parar todo | `~/proyecto/scripts/down.sh` |
+| Pruebas | `~/proyecto/scripts/test.sh` |
+| Copia de seguridad | `~/proyecto/scripts/backup.sh` |
+| Actualizar | `~/proyecto/scripts/update.sh` |
+| Estado | `docker ps` |
+| Logs en vivo | `docker logs -f <contenedor>` |
+| Estado de GPU | `nvidia-smi` |
+| Modelos instalados | `docker exec ollama ollama list` |
+| Modelos en memoria | `docker exec ollama ollama ps` |
+| Validar un `.yml` | `docker compose -f docker-<servicio>.yml --env-file .env config -q` |
+| Ver la red | `docker network inspect red-ia \| jq '.[0].Containers[].Name'` |
+
+## Apéndice C. Lista de comprobación de los criterios de aceptación
+
+| # | Criterio | Cómo se comprueba |
+| :-: | :--- | :--- |
+| 1 | Ficheros `docker-<servicio>.yml` funcionales y sin errores | Bucle de validación de la sección 5.2, paso 3: todos deben mostrar `OK` |
+| 2 | Contenedores usan CUDA/GPU | Sección 5.7 y bloque 3 de `test.sh`. Ollama, ComfyUI, YOLO y Open WebUI ven la GPU; SearXNG, Qdrant, Hermes y OpenCode no tienen carga de cálculo que acelerar (la GPU la usa Ollama en su nombre) |
+| 3 | Sin colisiones de puertos | Tabla 4.1; `docker ps` no debe mostrar errores `port is already allocated` |
+| 4 | Explicaciones paso a paso para un administrador novato | Secciones 1 a 7: cada paso incluye el comando exacto y su verificación |
