@@ -1,0 +1,2135 @@
+# Manual técnico
+
+## Despliegue de una pila de IA local en Docker sobre Ubuntu
+
+**Versión:** 1.0
+**Fecha:** 2026-10-06
+**Rol:** Administrador de sistemas
+**Plataforma:** Ubuntu Server 24.04 / 26.04
+**Virtualización:** Docker Engine + Docker Compose
+**Aceleración:** NVIDIA GPU + NVIDIA Container Toolkit
+
+---
+
+# 1. Objetivo
+
+El objetivo es desplegar una infraestructura de Inteligencia Artificial local formada por varios servicios Docker conectados mediante una red privada denominada `red-ia`.
+
+La arquitectura permitirá:
+
+* Ejecutar modelos LLM localmente mediante Ollama.
+* Utilizar Open WebUI como interfaz web.
+* Ejecutar agentes autónomos mediante Hermes Agent.
+* Utilizar OpenCode como agente de programación.
+* Generar imágenes y vídeo mediante ComfyUI.
+* Realizar detección de objetos mediante YOLO.
+* Realizar búsquedas web mediante SearXNG.
+* Implementar RAG mediante Open WebUI + Ollama + ChromaDB.
+
+Todos los servicios estarán aislados en contenedores y utilizarán almacenamiento persistente.
+
+---
+
+# 2. Arquitectura definitiva
+
+| Servicio     | Contenedor     | Puerto interno | Puerto host | GPU          |
+| ------------ | -------------- | -------------: | ----------: | ------------ |
+| Ollama       | `ollama`       |          11434 |       11434 | Sí           |
+| Open WebUI   | `openwebui`    |           8080 |        3000 | Opcional     |
+| Hermes Agent | `hermes-agent` |           8642 |        8642 | Según modelo |
+| OpenCode     | `opencode`     |           4096 |        4096 | No directa   |
+| ComfyUI      | `comfyui`      |           8188 |        8188 | Sí           |
+| YOLO         | `yolo`         |           5000 |        5000 | Sí           |
+| SearXNG      | `searxng`      |           8080 |        8080 | No           |
+| ChromaDB/RAG | `rag`          |           8000 | No publicar | No           |
+
+La ausencia de publicación del puerto 8000 de ChromaDB es intencionada. Open WebUI accederá directamente mediante:
+
+```text
+http://rag:8000
+```
+
+La comunicación entre contenedores se realiza mediante DNS interno de Docker.
+
+---
+
+# 3. Prerrequisitos
+
+## 3.1. Hardware recomendado
+
+Como mínimo:
+
+* CPU x86_64.
+* 16 GB de RAM.
+* SSD con al menos 100 GB libres.
+* GPU NVIDIA compatible.
+* 8 GB de VRAM como mínimo recomendable para modelos pequeños.
+* 12-16 GB o más de VRAM para modelos considerablemente mayores.
+
+El almacenamiento necesario puede aumentar rápidamente porque los modelos LLM, checkpoints de ComfyUI y modelos YOLO pueden ocupar muchos GB.
+
+---
+
+# 4. Comprobar Ubuntu
+
+```bash
+lsb_release -a
+```
+
+Debe aparecer Ubuntu 24.04 o 26.04.
+
+Comprobar arquitectura:
+
+```bash
+uname -m
+```
+
+Resultado esperado:
+
+```text
+x86_64
+```
+
+Actualizar el sistema:
+
+```bash
+sudo apt update
+sudo apt upgrade -y
+```
+
+Instalar herramientas básicas:
+
+```bash
+sudo apt install -y \
+    ca-certificates \
+    curl \
+    gnupg \
+    git \
+    wget \
+    nano \
+    unzip \
+    htop \
+    jq \
+    openssl
+```
+
+---
+
+# 5. Instalación del driver NVIDIA
+
+Primero comprobar si ya existe un driver:
+
+```bash
+nvidia-smi
+```
+
+Si aparece información de la GPU, el driver está funcionando.
+
+Ejemplo:
+
+```text
++-----------------------------------------------------------------------------+
+| NVIDIA-SMI ...
+| GPU Name ...
+| Driver Version ...
+| CUDA Version ...
++-----------------------------------------------------------------------------+
+```
+
+Si `nvidia-smi` no existe, instalar el driver mediante APT.
+
+Actualizar repositorios:
+
+```bash
+sudo apt update
+```
+
+Consultar los drivers disponibles:
+
+```bash
+ubuntu-drivers devices
+```
+
+Instalar el recomendado:
+
+```bash
+sudo ubuntu-drivers autoinstall
+```
+
+Reiniciar:
+
+```bash
+sudo reboot
+```
+
+Volver a comprobar:
+
+```bash
+nvidia-smi
+```
+
+IMPORTANTE:
+
+No es necesario instalar manualmente todo el CUDA Toolkit para que Docker pueda utilizar la GPU. Para contenedores NVIDIA, el componente fundamental es el driver del host junto con NVIDIA Container Toolkit.
+
+---
+
+# 6. Instalación de Docker Engine
+
+Eliminar posibles paquetes antiguos:
+
+```bash
+sudo apt remove -y \
+    docker.io \
+    docker-compose \
+    docker-doc \
+    podman-docker \
+    containerd \
+    runc
+```
+
+Crear el directorio de claves:
+
+```bash
+sudo install -m 0755 -d /etc/apt/keyrings
+```
+
+Descargar la clave oficial de Docker:
+
+```bash
+sudo curl -fsSL \
+    https://download.docker.com/linux/ubuntu/gpg \
+    -o /etc/apt/keyrings/docker.asc
+```
+
+Asignar permisos:
+
+```bash
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+```
+
+Añadir el repositorio:
+
+```bash
+echo \
+  "deb [arch=$(dpkg --print-architecture) \
+  signed-by=/etc/apt/keyrings/docker.asc] \
+  https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+```
+
+Actualizar:
+
+```bash
+sudo apt update
+```
+
+Instalar Docker:
+
+```bash
+sudo apt install -y \
+    docker-ce \
+    docker-ce-cli \
+    containerd.io \
+    docker-buildx-plugin \
+    docker-compose-plugin
+```
+
+Docker recomienda actualmente utilizar Docker Compose V2 mediante:
+
+```bash
+docker compose
+```
+
+y no el antiguo:
+
+```bash
+docker-compose
+```
+
+---
+
+# 7. Comprobar Docker
+
+Comprobar versión:
+
+```bash
+docker --version
+```
+
+Comprobar Compose:
+
+```bash
+docker compose version
+```
+
+Comprobar servicio:
+
+```bash
+sudo systemctl status docker
+```
+
+Debe aparecer:
+
+```text
+active (running)
+```
+
+Probar Docker:
+
+```bash
+sudo docker run --rm hello-world
+```
+
+Si aparece el mensaje de bienvenida de Docker, el motor funciona correctamente.
+
+---
+
+# 8. Permitir Docker sin sudo
+
+Añadir el usuario actual al grupo Docker:
+
+```bash
+sudo usermod -aG docker $USER
+```
+
+Cerrar la sesión y volver a entrar.
+
+También puede utilizarse:
+
+```bash
+newgrp docker
+```
+
+Comprobar:
+
+```bash
+docker ps
+```
+
+Si no aparece un error de permisos, está correctamente configurado.
+
+ADVERTENCIA:
+
+Pertenecer al grupo `docker` proporciona privilegios equivalentes a root sobre el sistema.
+
+---
+
+# 9. Instalar NVIDIA Container Toolkit
+
+Instalar dependencias:
+
+```bash
+sudo apt-get update
+
+sudo apt-get install -y \
+    ca-certificates \
+    curl \
+    gnupg2
+```
+
+Añadir la clave:
+
+```bash
+curl -fsSL \
+https://nvidia.github.io/libnvidia-container/gpgkey \
+| sudo gpg --dearmor \
+-o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+```
+
+Añadir repositorio:
+
+```bash
+curl -s -L \
+https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+| sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+| sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+```
+
+Actualizar:
+
+```bash
+sudo apt update
+```
+
+Instalar:
+
+```bash
+sudo apt install -y nvidia-container-toolkit
+```
+
+Configurar Docker:
+
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker
+```
+
+Reiniciar Docker:
+
+```bash
+sudo systemctl restart docker
+```
+
+---
+
+# 10. Probar GPU desde Docker
+
+Comprobar CDI:
+
+```bash
+nvidia-ctk cdi list
+```
+
+Debe aparecer algo parecido a:
+
+```text
+nvidia.com/gpu=0
+nvidia.com/gpu=all
+```
+
+Probar directamente:
+
+```bash
+docker run --rm \
+    --device nvidia.com/gpu=all \
+    nvidia/cuda:12.9.0-base-ubuntu24.04 \
+    nvidia-smi
+```
+
+Si `nvidia-smi` muestra la GPU desde dentro del contenedor, la integración Docker + NVIDIA funciona.
+
+---
+
+# 11. Estructura del proyecto
+
+Crear:
+
+```bash
+mkdir -p "$HOME/proyecto"
+cd "$HOME/proyecto"
+```
+
+Estructura:
+
+```text
+proyecto/
+├── .env
+├── .gitignore
+├── docker-ollama.yml
+├── docker-openwebui.yml
+├── docker-hermes-agent.yml
+├── docker-opencode.yml
+├── docker-comfyui.yml
+├── docker-yolo.yml
+├── docker-searxng.yml
+├── docker-rag.yml
+│
+├── config/
+│   └── searxng/
+│       └── settings.yml
+│
+├── data/
+│   ├── ollama/
+│   ├── openwebui/
+│   ├── hermes/
+│   ├── opencode/
+│   ├── comfyui/
+│   │   ├── models/
+│   │   ├── input/
+│   │   ├── output/
+│   │   ├── custom_nodes/
+│   │   └── user/
+│   ├── yolo/
+│   ├── searxng/
+│   └── rag/
+│
+└── backups/
+```
+
+Crear los directorios:
+
+```bash
+mkdir -p data/{ollama,openwebui,hermes,opencode,yolo,searxng,rag}
+
+mkdir -p data/comfyui/{models,input,output,custom_nodes,user}
+
+mkdir -p config/searxng
+mkdir -p backups
+```
+
+---
+
+# 12. Red Docker
+
+Crear la red:
+
+```bash
+docker network create red-ia
+```
+
+Comprobar:
+
+```bash
+docker network ls
+```
+
+Debe aparecer:
+
+```text
+red-ia
+```
+
+Los contenedores conectados a esta red podrán localizarse mediante su nombre.
+
+Por ejemplo:
+
+```text
+ollama:11434
+openwebui:8080
+hermes-agent:8642
+opencode:4096
+comfyui:8188
+yolo:5000
+searxng:8080
+rag:8000
+```
+
+---
+
+# 13. Variables de entorno
+
+Crear:
+
+```bash
+nano .env
+```
+
+Contenido:
+
+```dotenv
+PROJECT_DIR=${HOME}/proyecto
+
+OLLAMA_PORT=11434
+OPENWEBUI_PORT=3000
+HERMES_PORT=8642
+OPENCODE_PORT=4096
+COMFYUI_PORT=8188
+YOLO_PORT=5000
+SEARXNG_PORT=8080
+
+WEBUI_SECRET_KEY=CAMBIAR_POR_UN_SECRETO
+
+RAG_EMBEDDING_ENGINE=ollama
+RAG_EMBEDDING_MODEL=nomic-embed-text
+
+CHROMA_HTTP_HOST=rag
+CHROMA_HTTP_PORT=8000
+VECTOR_DB=chroma
+
+OLLAMA_BASE_URL=http://ollama:11434
+
+OPENCODE_SERVER_PASSWORD=CAMBIAR_POR_UNA_CONTRASENA
+
+HERMES_UID=1000
+HERMES_GID=1000
+```
+
+Generar una clave segura:
+
+```bash
+openssl rand -hex 32
+```
+
+Sustituir:
+
+```text
+CAMBIAR_POR_UN_SECRETO
+```
+
+por el resultado.
+
+Proteger el fichero:
+
+```bash
+chmod 600 .env
+```
+
+---
+
+# 14. Docker Compose — Ollama
+
+Archivo:
+
+```text
+docker-ollama.yml
+```
+
+Contenido:
+
+```yaml
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+
+    ports:
+      - "${OLLAMA_PORT}:11434"
+
+    volumes:
+      - "${PROJECT_DIR}/data/ollama:/root/.ollama"
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu
+
+    networks:
+      - red-ia
+
+networks:
+  red-ia:
+    external: true
+```
+
+Arrancar:
+
+```bash
+docker compose \
+    --env-file .env \
+    -f docker-ollama.yml \
+    up -d
+```
+
+Comprobar:
+
+```bash
+docker ps
+```
+
+Probar API:
+
+```bash
+curl http://localhost:11434/api/tags
+```
+
+---
+
+# 15. Descargar un modelo
+
+Ejemplo:
+
+```bash
+docker exec -it ollama ollama pull qwen3:8b
+```
+
+Comprobar:
+
+```bash
+docker exec -it ollama ollama list
+```
+
+Probar:
+
+```bash
+docker exec -it ollama ollama run qwen3:8b
+```
+
+Para RAG instalar también un modelo de embeddings:
+
+```bash
+docker exec -it ollama ollama pull nomic-embed-text
+```
+
+---
+
+# 16. Docker Compose — Open WebUI
+
+Archivo:
+
+```text
+docker-openwebui.yml
+```
+
+Contenido:
+
+```yaml
+services:
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: openwebui
+    restart: unless-stopped
+
+    ports:
+      - "${OPENWEBUI_PORT}:8080"
+
+    volumes:
+      - "${PROJECT_DIR}/data/openwebui:/app/backend/data"
+
+    environment:
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+
+      OLLAMA_BASE_URL: http://ollama:11434
+
+      VECTOR_DB: chroma
+      CHROMA_HTTP_HOST: rag
+      CHROMA_HTTP_PORT: 8000
+
+      RAG_EMBEDDING_ENGINE: ollama
+      RAG_EMBEDDING_MODEL: nomic-embed-text
+
+    networks:
+      - red-ia
+
+networks:
+  red-ia:
+    external: true
+```
+
+Arrancar:
+
+```bash
+docker compose \
+    --env-file .env \
+    -f docker-openwebui.yml \
+    up -d
+```
+
+Abrir:
+
+```text
+http://IP_DEL_SERVIDOR:3000
+```
+
+La primera cuenta creada será la cuenta administradora.
+
+---
+
+# 17. Docker Compose — RAG / ChromaDB
+
+En esta arquitectura `rag` representa el almacenamiento vectorial que hace posible el RAG.
+
+Archivo:
+
+```text
+docker-rag.yml
+```
+
+Contenido:
+
+```yaml
+services:
+  rag:
+    image: chromadb/chroma:1.1.1
+    container_name: rag
+    restart: unless-stopped
+
+    volumes:
+      - "${PROJECT_DIR}/data/rag:/data"
+
+    networks:
+      - red-ia
+
+networks:
+  red-ia:
+    external: true
+```
+
+No se publica:
+
+```yaml
+ports:
+```
+
+porque solamente Open WebUI necesita acceder a él.
+
+Desde Open WebUI:
+
+```text
+http://rag:8000
+```
+
+---
+
+# 18. Docker Compose — Hermes Agent
+
+Hermes utiliza actualmente un gateway API basado en el puerto 8642.
+
+Archivo:
+
+```text
+docker-hermes-agent.yml
+```
+
+Contenido:
+
+```yaml
+services:
+  hermes-agent:
+    image: nousresearch/hermes-agent:latest
+    container_name: hermes-agent
+    restart: unless-stopped
+
+    command:
+      - gateway
+      - run
+
+    ports:
+      - "${HERMES_PORT}:8642"
+
+    volumes:
+      - "${PROJECT_DIR}/data/hermes:/opt/data"
+
+    environment:
+      HERMES_UID: ${HERMES_UID}
+      HERMES_GID: ${HERMES_GID}
+
+    networks:
+      - red-ia
+```
+
+Arrancar:
+
+```bash
+docker compose \
+    --env-file .env \
+    -f docker-hermes-agent.yml \
+    up -d
+```
+
+Hermes puede configurarse para utilizar Ollama mediante:
+
+```yaml
+model:
+  provider: custom
+  base_url: http://ollama:11434/v1
+  api_key: "none"
+```
+
+La configuración de Hermes debe almacenarse en:
+
+```text
+data/hermes/
+```
+
+Comprobar:
+
+```bash
+docker logs hermes-agent
+```
+
+---
+
+# 19. Docker Compose — OpenCode
+
+OpenCode dispone de una imagen Docker oficial:
+
+```text
+ghcr.io/anomalyco/opencode
+```
+
+Archivo:
+
+```text
+docker-opencode.yml
+```
+
+Contenido:
+
+```yaml
+services:
+  opencode:
+    image: ghcr.io/anomalyco/opencode:latest
+    container_name: opencode
+    restart: unless-stopped
+
+    command:
+      - serve
+      - --hostname
+      - 0.0.0.0
+      - --port
+      - "4096"
+
+    ports:
+      - "${OPENCODE_PORT}:4096"
+
+    environment:
+      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD}
+
+    volumes:
+      - "${PROJECT_DIR}/data/opencode:/workspace"
+
+    networks:
+      - red-ia
+
+networks:
+  red-ia:
+    external: true
+```
+
+IMPORTANTE:
+
+El contenedor necesita un directorio de trabajo con código. En una instalación real conviene montar:
+
+```text
+data/opencode/
+```
+
+con los repositorios que se quieran administrar.
+
+OpenCode puede utilizar un proveedor compatible con OpenAI apuntando a Ollama:
+
+```text
+http://ollama:11434/v1
+```
+
+---
+
+# 20. Docker Compose — ComfyUI
+
+Archivo:
+
+```text
+docker-comfyui.yml
+```
+
+Se utilizará una imagen Docker de ComfyUI preparada para NVIDIA.
+
+Ejemplo:
+
+```yaml
+services:
+  comfyui:
+    image: mmartial/comfyui-nvidia-docker:latest
+    container_name: comfyui
+    restart: unless-stopped
+
+    ports:
+      - "${COMFYUI_PORT}:8188"
+
+    volumes:
+      - "${PROJECT_DIR}/data/comfyui:/comfy/mnt"
+
+    environment:
+      WANTED_UID: 1000
+      WANTED_GID: 1000
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu
+
+    networks:
+      - red-ia
+
+networks:
+  red-ia:
+    external: true
+```
+
+Abrir:
+
+```text
+http://IP_DEL_SERVIDOR:8188
+```
+
+Los modelos se almacenarán de forma persistente.
+
+---
+
+# 21. Docker Compose — YOLO
+
+Para YOLO se utilizará una imagen de Ultralytics.
+
+Archivo:
+
+```text
+docker-yolo.yml
+```
+
+Contenido base:
+
+```yaml
+services:
+  yolo:
+    image: ultralytics/ultralytics:latest
+    container_name: yolo
+    restart: unless-stopped
+
+    working_dir: /workspace
+
+    ports:
+      - "${YOLO_PORT}:5000"
+
+    volumes:
+      - "${PROJECT_DIR}/data/yolo:/workspace"
+
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu
+
+    networks:
+      - red-ia
+
+networks:
+  red-ia:
+    external: true
+```
+
+IMPORTANTE:
+
+La imagen de Ultralytics es principalmente un entorno de ejecución. El puerto 5000 no significa automáticamente que exista una API HTTP escuchando en ese puerto.
+
+Para cumplir estrictamente el requisito:
+
+```text
+http://yolo:5000
+```
+
+habrá que implementar una pequeña API Flask/FastAPI encima de Ultralytics.
+
+Por tanto, **no se debe afirmar que este Compose por sí solo proporciona una API YOLO en el puerto 5000**.
+
+---
+
+# 22. Docker Compose — SearXNG
+
+SearXNG no necesita NVIDIA.
+
+Archivo:
+
+```text
+docker-searxng.yml
+```
+
+Configuración simplificada:
+
+```yaml
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+
+    ports:
+      - "${SEARXNG_PORT}:8080"
+
+    volumes:
+      - "${PROJECT_DIR}/data/searxng:/etc/searxng"
+
+    environment:
+      SEARXNG_BASE_URL: http://localhost:8080/
+
+    networks:
+      - red-ia
+
+networks:
+  red-ia:
+    external: true
+```
+
+Abrir:
+
+```text
+http://IP_DEL_SERVIDOR:8080
+```
+
+Para permitir que otros servicios consulten SearXNG, se utilizará:
+
+```text
+http://searxng:8080
+```
+
+---
+
+# 23. Configuración SearXNG para API JSON
+
+Editar:
+
+```bash
+nano config/searxng/settings.yml
+```
+
+La configuración debe permitir el formato JSON:
+
+```yaml
+search:
+  formats:
+    - html
+    - json
+```
+
+Reiniciar:
+
+```bash
+docker compose \
+    --env-file .env \
+    -f docker-searxng.yml \
+    restart
+```
+
+Comprobar:
+
+```bash
+curl \
+  "http://localhost:8080/search?q=docker&format=json"
+```
+
+---
+
+# 24. Orden de despliegue
+
+No iniciar todos los servicios simultáneamente la primera vez.
+
+Crear primero la red:
+
+```bash
+docker network create red-ia
+```
+
+O, si ya existe:
+
+```bash
+docker network inspect red-ia
+```
+
+Iniciar Ollama:
+
+```bash
+docker compose --env-file .env \
+    -f docker-ollama.yml up -d
+```
+
+Comprobar:
+
+```bash
+docker logs ollama
+```
+
+Iniciar RAG:
+
+```bash
+docker compose --env-file .env \
+    -f docker-rag.yml up -d
+```
+
+Iniciar Open WebUI:
+
+```bash
+docker compose --env-file .env \
+    -f docker-openwebui.yml up -d
+```
+
+Después:
+
+```bash
+docker compose --env-file .env \
+    -f docker-hermes-agent.yml up -d
+```
+
+Después:
+
+```bash
+docker compose --env-file .env \
+    -f docker-opencode.yml up -d
+```
+
+Después:
+
+```bash
+docker compose --env-file .env \
+    -f docker-comfyui.yml up -d
+```
+
+Después:
+
+```bash
+docker compose --env-file .env \
+    -f docker-yolo.yml up -d
+```
+
+Finalmente:
+
+```bash
+docker compose --env-file .env \
+    -f docker-searxng.yml up -d
+```
+
+---
+
+# 25. Comprobar todos los contenedores
+
+```bash
+docker ps
+```
+
+Resultado esperado:
+
+```text
+ollama
+openwebui
+hermes-agent
+opencode
+comfyui
+yolo
+searxng
+rag
+```
+
+Todos deberían aparecer con:
+
+```text
+Up
+```
+
+---
+
+# 26. Comprobar la red
+
+```bash
+docker network inspect red-ia
+```
+
+Deben aparecer todos los contenedores.
+
+---
+
+# 27. Pruebas de DNS interno
+
+Entrar en Open WebUI:
+
+```bash
+docker exec -it openwebui sh
+```
+
+Probar:
+
+```bash
+curl http://ollama:11434/api/tags
+```
+
+Debe devolver JSON.
+
+Probar Chroma:
+
+```bash
+curl http://rag:8000/api/v2/heartbeat
+```
+
+Salir:
+
+```bash
+exit
+```
+
+Desde Hermes:
+
+```bash
+docker exec -it hermes-agent sh
+```
+
+Probar Ollama:
+
+```bash
+curl http://ollama:11434/api/tags
+```
+
+Si funciona, Docker DNS está resolviendo correctamente el nombre:
+
+```text
+ollama
+```
+
+---
+
+# 28. Integración Ollama → Open WebUI
+
+La conexión debe utilizar:
+
+```text
+http://ollama:11434
+```
+
+No:
+
+```text
+http://localhost:11434
+```
+
+desde dentro de Open WebUI.
+
+La razón es que:
+
+```text
+localhost
+```
+
+dentro de un contenedor hace referencia al propio contenedor.
+
+Open WebUI utiliza:
+
+```text
+OLLAMA_BASE_URL=http://ollama:11434
+```
+
+Los modelos disponibles se obtienen mediante la API de Ollama.
+
+---
+
+# 29. Integración Ollama → Hermes
+
+Hermes debe utilizar el endpoint OpenAI-compatible de Ollama:
+
+```text
+http://ollama:11434/v1
+```
+
+Ejemplo conceptual:
+
+```yaml
+model:
+  provider: custom
+  base_url: http://ollama:11434/v1
+  api_key: "none"
+```
+
+El modelo debe coincidir con uno instalado:
+
+```bash
+docker exec ollama ollama list
+```
+
+Por ejemplo:
+
+```text
+qwen3:8b
+```
+
+---
+
+# 30. Integración Open WebUI → RAG
+
+Open WebUI utilizará:
+
+```text
+VECTOR_DB=chroma
+```
+
+y:
+
+```text
+CHROMA_HTTP_HOST=rag
+CHROMA_HTTP_PORT=8000
+```
+
+El flujo será:
+
+```text
+Documento
+   ↓
+Open WebUI
+   ↓
+Extracción de texto
+   ↓
+Ollama
+   ↓
+Modelo de embeddings
+   ↓
+ChromaDB
+   ↓
+Vectores
+```
+
+Durante una consulta:
+
+```text
+Pregunta
+   ↓
+Open WebUI
+   ↓
+Embedding
+   ↓
+ChromaDB
+   ↓
+Fragmentos relevantes
+   ↓
+Ollama
+   ↓
+Respuesta
+```
+
+---
+
+# 31. Integración Hermes → SearXNG
+
+Hermes debe utilizar el endpoint interno:
+
+```text
+http://searxng:8080
+```
+
+No:
+
+```text
+http://localhost:8080
+```
+
+El segundo hace referencia al propio contenedor Hermes.
+
+El flujo será:
+
+```text
+Hermes
+   ↓
+SearXNG
+   ↓
+Motores de búsqueda
+   ↓
+Internet
+   ↓
+Resultados
+   ↓
+Hermes
+```
+
+---
+
+# 32. Integración OpenCode → Ollama
+
+OpenCode puede utilizar un proveedor OpenAI-compatible.
+
+Endpoint:
+
+```text
+http://ollama:11434/v1
+```
+
+El modelo será uno existente en Ollama:
+
+```text
+qwen3:8b
+```
+
+Para programación conviene utilizar un modelo específicamente orientado a código cuando la VRAM disponible lo permita.
+
+---
+
+# 33. Integración con ComfyUI
+
+Los agentes pueden comunicarse con ComfyUI mediante su API HTTP.
+
+Desde otro contenedor:
+
+```text
+http://comfyui:8188
+```
+
+No se debe utilizar:
+
+```text
+localhost:8188
+```
+
+desde Hermes/Open WebUI/OpenCode.
+
+---
+
+# 34. YOLO
+
+YOLO utilizará directamente la GPU NVIDIA.
+
+Comprobación desde el contenedor:
+
+```bash
+docker exec -it yolo nvidia-smi
+```
+
+Comprobar instalación:
+
+```bash
+docker exec -it yolo yolo checks
+```
+
+Ejemplo de detección:
+
+```bash
+docker exec -it yolo \
+    yolo predict \
+    model=yolo26n.pt \
+    source=/workspace/input
+```
+
+Los resultados deben almacenarse en el directorio persistente:
+
+```text
+data/yolo/
+```
+
+---
+
+# 35. Comprobación global de GPU
+
+En el host:
+
+```bash
+nvidia-smi
+```
+
+Mientras Ollama, ComfyUI o YOLO estén procesando:
+
+```bash
+watch -n 1 nvidia-smi
+```
+
+También se puede comprobar desde cada contenedor:
+
+```bash
+docker exec ollama nvidia-smi
+```
+
+```bash
+docker exec comfyui nvidia-smi
+```
+
+```bash
+docker exec yolo nvidia-smi
+```
+
+---
+
+# 36. Logs
+
+Ollama:
+
+```bash
+docker logs ollama
+```
+
+Open WebUI:
+
+```bash
+docker logs openwebui
+```
+
+Hermes:
+
+```bash
+docker logs hermes-agent
+```
+
+OpenCode:
+
+```bash
+docker logs opencode
+```
+
+ComfyUI:
+
+```bash
+docker logs comfyui
+```
+
+YOLO:
+
+```bash
+docker logs yolo
+```
+
+SearXNG:
+
+```bash
+docker logs searxng
+```
+
+RAG:
+
+```bash
+docker logs rag
+```
+
+Seguir logs:
+
+```bash
+docker logs -f ollama
+```
+
+Últimas 100 líneas:
+
+```bash
+docker logs --tail 100 ollama
+```
+
+---
+
+# 37. Comprobar puertos
+
+En Ubuntu:
+
+```bash
+sudo ss -tulpn
+```
+
+Puertos principales:
+
+```text
+3000   Open WebUI
+4096   OpenCode
+5000   YOLO
+8080   SearXNG
+8188   ComfyUI
+8642   Hermes
+11434  Ollama
+```
+
+ChromaDB:
+
+```text
+8000
+```
+
+no se publica al host.
+
+---
+
+# 38. Actualización de servicios
+
+Antes de actualizar:
+
+```bash
+cd ~/proyecto
+```
+
+Realizar backup.
+
+Después, descargar las nuevas imágenes:
+
+```bash
+docker compose \
+    --env-file .env \
+    -f docker-ollama.yml \
+    pull
+```
+
+Actualizar:
+
+```bash
+docker compose \
+    --env-file .env \
+    -f docker-ollama.yml \
+    up -d
+```
+
+Repetir para los servicios.
+
+También puede hacerse:
+
+```bash
+docker compose \
+    --env-file .env \
+    -f docker-openwebui.yml \
+    pull
+
+docker compose \
+    --env-file .env \
+    -f docker-openwebui.yml \
+    up -d
+```
+
+No utilizar automáticamente `latest` en una instalación de producción crítica. Para máxima reproducibilidad es preferible fijar versiones concretas de las imágenes.
+
+---
+
+# 39. Backup
+
+Crear backup:
+
+```bash
+tar -czf \
+    backups/proyecto-$(date +%Y-%m-%d).tar.gz \
+    .env \
+    data \
+    config
+```
+
+Comprobar:
+
+```bash
+ls -lh backups/
+```
+
+IMPORTANTE:
+
+Los modelos de Ollama y ComfyUI pueden ocupar decenas o cientos de GB.
+
+Para un backup eficiente puede ser preferible separar:
+
+1. Configuración.
+2. Bases de datos.
+3. Documentos.
+4. Modelos.
+5. Resultados generados.
+
+---
+
+# 40. Problemas de permisos
+
+Comprobar propietario:
+
+```bash
+ls -la data/
+```
+
+Si un contenedor ha creado archivos como root:
+
+```bash
+sudo chown -R $USER:$USER data/
+```
+
+Comprobar UID:
+
+```bash
+id
+```
+
+Resultado:
+
+```text
+uid=1000(...)
+gid=1000(...)
+```
+
+Ese UID/GID debe coincidir con los valores configurados cuando la aplicación lo requiera.
+
+---
+
+# 41. Problema: Docker no ve la GPU
+
+Primero:
+
+```bash
+nvidia-smi
+```
+
+Si falla, el problema está en el driver.
+
+Si funciona:
+
+```bash
+nvidia-ctk cdi list
+```
+
+Si no aparecen dispositivos:
+
+```bash
+sudo systemctl restart nvidia-cdi-refresh.service
+```
+
+Comprobar:
+
+```bash
+nvidia-ctk cdi list
+```
+
+Después comprobar Docker:
+
+```bash
+docker run --rm \
+    --device nvidia.com/gpu=all \
+    nvidia/cuda:12.9.0-base-ubuntu24.04 \
+    nvidia-smi
+```
+
+---
+
+# 42. Problema: un contenedor no puede conectarse a Ollama
+
+Desde el contenedor:
+
+```bash
+curl http://ollama:11434/api/tags
+```
+
+Si funciona:
+
+```text
+Docker DNS → correcto
+Ollama → correcto
+Red → correcta
+```
+
+Si falla:
+
+```bash
+docker network inspect red-ia
+```
+
+Comprobar que ambos contenedores pertenecen a la red.
+
+---
+
+# 43. Problema: se utiliza localhost incorrectamente
+
+Incorrecto:
+
+```text
+http://localhost:11434
+```
+
+desde Open WebUI.
+
+Correcto:
+
+```text
+http://ollama:11434
+```
+
+Incorrecto:
+
+```text
+http://localhost:8080
+```
+
+desde Hermes para acceder a SearXNG.
+
+Correcto:
+
+```text
+http://searxng:8080
+```
+
+Regla general:
+
+```text
+localhost = este mismo contenedor
+nombre-contenedor = otro contenedor
+```
+
+---
+
+# 44. Problema: puerto ocupado
+
+Comprobar:
+
+```bash
+sudo ss -ltnp | grep :3000
+```
+
+Por ejemplo:
+
+```bash
+sudo ss -ltnp | grep :8188
+```
+
+Si un proceso utiliza el puerto, cambiar la variable correspondiente en `.env`.
+
+Por ejemplo:
+
+```dotenv
+COMFYUI_PORT=8288
+```
+
+El puerto interno continúa siendo:
+
+```text
+8188
+```
+
+y solamente cambia el puerto del host.
+
+---
+
+# 45. Problema: contenedor reinicia continuamente
+
+Comprobar:
+
+```bash
+docker ps -a
+```
+
+Después:
+
+```bash
+docker logs nombre-contenedor
+```
+
+Por ejemplo:
+
+```bash
+docker logs hermes-agent
+```
+
+También:
+
+```bash
+docker inspect hermes-agent
+```
+
+Buscar:
+
+```text
+ExitCode
+```
+
+Un código distinto de:
+
+```text
+0
+```
+
+indica que el proceso principal terminó con error.
+
+---
+
+# 46. Seguridad
+
+No publicar directamente en Internet:
+
+```text
+11434 Ollama
+8000 ChromaDB
+8642 Hermes
+4096 OpenCode
+5000 YOLO
+```
+
+salvo que exista una razón específica y autenticación adecuada.
+
+Idealmente, el servidor solamente expondrá las interfaces web necesarias:
+
+```text
+3000 Open WebUI
+8080 SearXNG
+8188 ComfyUI
+4096 OpenCode
+```
+
+Si se accede desde Internet, utilizar:
+
+```text
+HTTPS
+reverse proxy
+autenticación
+firewall
+```
+
+Nunca publicar contraseñas dentro de los archivos Compose.
+
+Utilizar `.env` y protegerlo:
+
+```bash
+chmod 600 .env
+```
+
+Añadir:
+
+```text
+.env
+```
+
+a:
+
+```text
+.gitignore
+```
+
+---
+
+# 47. .gitignore
+
+Crear:
+
+```bash
+nano .gitignore
+```
+
+Contenido:
+
+```gitignore
+.env
+
+data/
+backups/
+
+*.log
+*.key
+*.pem
+
+__pycache__/
+```
+
+---
+
+# 48. Prueba de aceptación
+
+## Docker
+
+```bash
+docker --version
+docker compose version
+```
+
+## NVIDIA
+
+```bash
+nvidia-smi
+```
+
+## NVIDIA Container Toolkit
+
+```bash
+nvidia-ctk cdi list
+```
+
+## Red
+
+```bash
+docker network inspect red-ia
+```
+
+## Contenedores
+
+```bash
+docker ps
+```
+
+Deben estar activos:
+
+```text
+ollama
+openwebui
+hermes-agent
+opencode
+comfyui
+yolo
+searxng
+rag
+```
+
+## Ollama
+
+```bash
+curl http://localhost:11434/api/tags
+```
+
+## Open WebUI
+
+```text
+http://IP:3000
+```
+
+## OpenCode
+
+```text
+http://IP:4096
+```
+
+## ComfyUI
+
+```text
+http://IP:8188
+```
+
+## SearXNG
+
+```text
+http://IP:8080
+```
+
+## Hermes
+
+```bash
+docker logs hermes-agent
+```
+
+## GPU
+
+```bash
+docker exec ollama nvidia-smi
+docker exec comfyui nvidia-smi
+docker exec yolo nvidia-smi
+```
+
+## RAG
+
+Subir un PDF desde Open WebUI y comprobar que puede realizar preguntas sobre su contenido.
+
+---
+
+# 49. Resultado final
+
+La arquitectura resultante será:
+
+```text
+Ubuntu Server
+│
+├── NVIDIA Driver
+├── NVIDIA Container Toolkit
+├── Docker Engine
+├── Docker Compose
+│
+└── red-ia
+    │
+    ├── ollama
+    │   └── NVIDIA GPU
+    │
+    ├── openwebui
+    │   ├── Ollama
+    │   └── RAG
+    │
+    ├── hermes-agent
+    │   ├── Ollama
+    │   ├── SearXNG
+    │   └── ComfyUI
+    │
+    ├── opencode
+    │   └── Ollama
+    │
+    ├── comfyui
+    │   └── NVIDIA GPU
+    │
+    ├── yolo
+    │   └── NVIDIA GPU
+    │
+    ├── searxng
+    │   └── Internet
+    │
+    └── rag
+        └── ChromaDB
+```
+
+El punto fundamental de la arquitectura es que **los servicios no deben comunicarse mediante `localhost`, sino mediante los nombres DNS de Docker**:
+
+```text
+ollama:11434
+openwebui:8080
+hermes-agent:8642
+opencode:4096
+comfyui:8188
+yolo:5000
+searxng:8080
+rag:8000
+```
